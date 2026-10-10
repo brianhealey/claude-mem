@@ -148,6 +148,7 @@ exactly what that key can reach and nothing more.
 | **Memories** | Browse recent observations (new ones appear as they are generated), search with matches highlighted, filter by folder, kind, session or date, read one in full, export as JSON or Markdown. Write, edit or delete one. | `memories:read` (write, edit and delete need `memories:write`) |
 | **Sessions** | List sessions; open one to see its summary and a timeline of captured events, each with the memories generated from it and its raw payload on request. | `memories:read` |
 | **Pipeline** | Job counts by status, the provider and model last used, median capture-to-memory time, token and memory usage, per-lane queue depth, failed jobs grouped by reason, retry one or all. | `memories:read` (retry needs `memories:write`) |
+| **Value** | What memory costs against what it plausibly saves: tokens spent generating (measured), tokens handed back to agents and the raw tool output those memories stand in for (both estimated from text length), per day, with compression, recall counts and the most-recalled memories. | `memories:read` |
 | **Keys** | List the team's keys with their label and when each was last used, create a read-only or read-and-write key, revoke a key. | `memories:write` |
 | **Audit** | The team's audit trail: reads and searches, memories written, edited and deleted, keys created and revoked, jobs retried. | `memories:write` |
 
@@ -165,7 +166,13 @@ tick **Remember on this device**. Serve the dashboard over HTTPS anywhere the
 network is not trusted: the key is sent as a bearer header on every request.
 </Note>
 
-The usage figures on the Pipeline tab come from `usage_events`, which the
+The Value tab's "rediscovery avoided" is a proxy, not a measurement: it is the
+size of the tool output behind each recalled memory, and assumes the agent would
+otherwise have redone that work. Reads made from the dashboard itself are left
+out of it (the page sends `X-Claude-Mem-Client: dashboard`, recorded on its audit
+rows).
+
+The usage figures on the Pipeline and Value tabs come from `usage_events`, which the
 generation worker only writes when it runs with `CLAUDE_MEM_USAGE_METERING=1`.
 
 `/v1/search` matches on the full-text index and also on a plain substring, so a
@@ -316,6 +323,7 @@ DELETE /v1/keys/:id               # revoke a key (write scope)
 GET    /v1/audit                  # the team's audit trail (write scope; limit, offset, action)
 GET    /v1/connect                # connect command with key placeholder
 GET    /v1/usage                  # usage totals for this month and today
+GET    /v1/value?projectId=       # daily cost and estimated savings of recall (days=7..90)
 DELETE /v1/projects/:projectId/memory   # purge a whole project
 ```
 

@@ -57,6 +57,16 @@ const JOB_LATENCY_SAMPLE_SIZE = 50;
 const BULK_RETRY_MAX_JOBS = 200;
 const AUDIT_LIST_DEFAULT_LIMIT = 100;
 const AUDIT_LIST_MAX_LIMIT = 500;
+const VALUE_DEFAULT_DAYS = 30;
+const VALUE_MAX_DAYS = 90;
+// The estimates in /v1/value convert text to tokens at this rate. Rough by
+// design: the route reports the figure so a reader can see it is an estimate.
+const VALUE_CHARS_PER_TOKEN = 4;
+const VALUE_MAX_RECALL_ROWS = 50_000;
+const VALUE_TOP_RECALLED = 10;
+// The audit modes that are an agent recalling memory, as opposed to a person
+// paging through it ('list') or looking at the queue ('jobs_list').
+const VALUE_RECALL_MODES = ['context', 'search', 'recent'];
 
 declare const __DEFAULT_PACKAGE_VERSION__: string;
 const MCP_SERVER_VERSION =
@@ -461,6 +471,179 @@ export class ServerV1PostgresRoutes implements RouteHandler {
       res.status(200).json({
         observationCount: Number(row?.count ?? 0),
         latestCreatedAtEpoch: row?.latest ? new Date(row.latest).getTime() : null,
+      });
+    }));
+
+    // GET /v1/value?projectId= — what memory costs and what it plausibly saves,
+    // per day over a window. Three token figures:
+    //   generation  measured: what the provider reported for generating memories
+    //   injected    estimated: the size of every memory handed back to an agent
+    //   replaced    estimated: the size of the raw tool output each of those
+    //               memories was distilled from, i.e. roughly what rediscovering
+    //               it would have put in the agent's context instead
+    // The last two are text length / VALUE_CHARS_PER_TOKEN, and "replaced"
+    // assumes the agent would otherwise have redone the work, which nothing
+    // here can check. It is a proxy for value, reported as one.
+    app.get('/v1/value', readAuth, this.asyncHandler(async (req, res) => {
+      const teamId = this.requireTeamId(req, res);
+      if (!teamId) return;
+      const projectId = typeof req.query.projectId === 'string' ? req.query.projectId : '';
+      if (!projectId) {
+        res.status(400).json({ error: 'ValidationError', message: 'projectId required' });
+        return;
+      }
+      if (!this.ensureProjectAllowed(req, res, projectId)) return;
+      const days = clampListLimit(req.query.days, VALUE_DEFAULT_DAYS, VALUE_MAX_DAYS);
+      const now = new Date();
+      const since = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate() - (days - 1)));
+
+      const [recallRows, generationRows, storeRow, searchRow] = await Promise.all([
+        // One row per (recall, memory): each time an agent was handed a memory.
+        // A memory's source size is its events' payloads, an event shared by
+        // several memories split evenly between them.
+        this.options.pool.query<{
+          audit_id: string; recalled_at: Date; observation_id: string; chars: number;
+          source_chars: string; observed_at: Date; kind: string; title: string;
+        }>(
+          `
+            WITH recalls AS (
+              SELECT audit_log.id AS audit_id, audit_log.created_at AS recalled_at,
+                jsonb_array_elements_text(audit_log.details->'observationIds') AS observation_id
+              FROM audit_log
+              WHERE audit_log.team_id = $1 AND audit_log.project_id = $2
+                AND audit_log.action = 'observation.read'
+                AND audit_log.details->>'mode' = ANY($4::text[])
+                AND audit_log.details->>'client' IS NULL
+                AND audit_log.created_at >= $3
+                AND jsonb_typeof(audit_log.details->'observationIds') = 'array'
+            )
+            SELECT recalls.audit_id, recalls.recalled_at, observations.id AS observation_id,
+              length(observations.content) AS chars, observations.created_at AS observed_at,
+              observations.kind, split_part(observations.content, E'\n', 1) AS title,
+              COALESCE((
+                SELECT sum(length(agent_events.payload::text)::numeric / GREATEST((
+                  SELECT count(*) FROM observation_sources shared
+                  WHERE shared.agent_event_id = agent_events.id), 1))
+                FROM observation_sources
+                INNER JOIN agent_events ON agent_events.id = observation_sources.agent_event_id
+                WHERE observation_sources.observation_id = observations.id
+              ), 0) AS source_chars
+            FROM recalls
+            INNER JOIN observations ON observations.id = recalls.observation_id
+              AND observations.team_id = $1 AND observations.project_id = $2
+            ORDER BY recalls.recalled_at ASC
+            LIMIT $5
+          `,
+          [teamId, projectId, since, VALUE_RECALL_MODES, VALUE_MAX_RECALL_ROWS + 1],
+        ),
+        this.options.pool.query<{ day: string; tokens: string }>(
+          `
+            SELECT to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD') AS day, sum(quantity) AS tokens
+            FROM usage_events
+            WHERE team_id = $1 AND project_id = $2 AND kind = 'tokens' AND created_at >= $3
+            GROUP BY 1
+          `,
+          [teamId, projectId, since],
+        ),
+        this.options.pool.query<{ observations: string; observation_chars: string; event_chars: string }>(
+          `
+            SELECT
+              (SELECT count(*) FROM observations WHERE team_id = $1 AND project_id = $2) AS observations,
+              (SELECT COALESCE(sum(length(content)), 0) FROM observations WHERE team_id = $1 AND project_id = $2) AS observation_chars,
+              (SELECT COALESCE(sum(length(payload::text)), 0) FROM agent_events WHERE team_id = $1 AND project_id = $2) AS event_chars
+          `,
+          [teamId, projectId],
+        ),
+        this.options.pool.query<{ searches: string; empty: string }>(
+          `
+            SELECT count(*) AS searches,
+              count(*) FILTER (WHERE COALESCE((details->>'resultCount')::int, 0) = 0) AS empty
+            FROM audit_log
+            WHERE team_id = $1 AND project_id = $2 AND action = 'observation.read'
+              AND details->>'mode' = 'search' AND details->>'client' IS NULL AND created_at >= $3
+          `,
+          [teamId, projectId, since],
+        ),
+      ]);
+
+      const toTokens = (chars: number): number => Math.round(chars / VALUE_CHARS_PER_TOKEN);
+      const dayOf = (date: Date): string => new Date(date).toISOString().slice(0, 10);
+      const daily = new Map<string, { generationTokens: number; injectedChars: number; replacedChars: number; recalls: Set<string> }>();
+      for (let offset = 0; offset < days; offset += 1) {
+        const day = dayOf(new Date(since.getTime() + offset * 86_400_000));
+        daily.set(day, { generationTokens: 0, injectedChars: 0, replacedChars: 0, recalls: new Set() });
+      }
+      for (const row of generationRows.rows) {
+        const bucket = daily.get(row.day);
+        if (bucket) bucket.generationTokens = Number(row.tokens);
+      }
+
+      const rows = recallRows.rows.slice(0, VALUE_MAX_RECALL_ROWS);
+      const perMemory = new Map<string, { title: string; kind: string; recalls: number; lastRecalledAtEpoch: number }>();
+      const agesMs: number[] = [];
+      for (const row of rows) {
+        const chars = Number(row.chars);
+        // A memory never stands in for less than its own text: one written by
+        // hand, or a summary, has no source events to measure.
+        const replaced = Math.max(Number(row.source_chars), chars);
+        const recalledAt = new Date(row.recalled_at).getTime();
+        const bucket = daily.get(dayOf(row.recalled_at));
+        if (bucket) {
+          bucket.injectedChars += chars;
+          bucket.replacedChars += replaced;
+          bucket.recalls.add(row.audit_id);
+        }
+        const memory = perMemory.get(row.observation_id)
+          ?? { title: row.title, kind: row.kind, recalls: 0, lastRecalledAtEpoch: 0 };
+        memory.recalls += 1;
+        memory.lastRecalledAtEpoch = Math.max(memory.lastRecalledAtEpoch, recalledAt);
+        perMemory.set(row.observation_id, memory);
+        agesMs.push(Math.max(0, recalledAt - new Date(row.observed_at).getTime()));
+      }
+      agesMs.sort((a, b) => a - b);
+
+      const series = [...daily.entries()].map(([day, bucket]) => ({
+        day,
+        generationTokens: bucket.generationTokens,
+        injectedTokens: toTokens(bucket.injectedChars),
+        replacedTokens: toTokens(bucket.replacedChars),
+        recalls: bucket.recalls.size,
+      }));
+      const sum = (pick: (entry: typeof series[number]) => number): number => series.reduce((total, entry) => total + pick(entry), 0);
+      const generationTokens = sum(entry => entry.generationTokens);
+      const injectedTokens = sum(entry => entry.injectedTokens);
+      const replacedTokens = sum(entry => entry.replacedTokens);
+      const store = storeRow.rows[0];
+      const observationChars = Number(store?.observation_chars ?? 0);
+      const eventChars = Number(store?.event_chars ?? 0);
+
+      res.status(200).json({
+        windowDays: days,
+        since: since.toISOString(),
+        charsPerToken: VALUE_CHARS_PER_TOKEN,
+        daily: series,
+        totals: {
+          generationTokens,
+          injectedTokens,
+          replacedTokens,
+          netTokens: replacedTokens - injectedTokens - generationTokens,
+          recalls: sum(entry => entry.recalls),
+          memoriesRecalled: perMemory.size,
+          searches: Number(searchRow.rows[0]?.searches ?? 0),
+          emptySearches: Number(searchRow.rows[0]?.empty ?? 0),
+        },
+        store: {
+          observations: Number(store?.observations ?? 0),
+          observationTokens: toTokens(observationChars),
+          eventTokens: toTokens(eventChars),
+          compressionRatio: observationChars > 0 ? Number((eventChars / observationChars).toFixed(2)) : null,
+        },
+        medianAgeAtRecallMs: agesMs.length > 0 ? agesMs[Math.floor(agesMs.length / 2)] : null,
+        topRecalled: [...perMemory.entries()]
+          .sort(([, a], [, b]) => b.recalls - a.recalls || b.lastRecalledAtEpoch - a.lastRecalledAtEpoch)
+          .slice(0, VALUE_TOP_RECALLED)
+          .map(([id, memory]) => ({ id, ...memory })),
+        truncated: recallRows.rows.length > VALUE_MAX_RECALL_ROWS,
       });
     }));
 
@@ -1954,8 +2137,10 @@ export class ServerV1PostgresRoutes implements RouteHandler {
     // so dashboards and incident triage can pivot from a single HTTP
     // request to every ingest/job/audit row it produced. Caller-supplied
     // details win on key conflict so explicit overrides still work.
+    const client = auditClientLabel(req);
     const detailsWithRequestId: Record<string, unknown> = {
       ...(req.requestId ? { requestId: req.requestId } : {}),
+      ...(client ? { client } : {}),
       ...(details ?? {}),
     };
     const auditInput = {
@@ -2415,6 +2600,15 @@ function clampListLimit(raw: unknown, fallback: number, max: number): number {
   const parsed = typeof raw === 'string' ? Number.parseInt(raw, 10) : Number.NaN;
   if (!Number.isFinite(parsed) || parsed <= 0) return fallback;
   return Math.min(parsed, max);
+}
+
+// X-Claude-Mem-Client names the caller ("dashboard"). Recorded on audit rows
+// so /v1/value can leave a person browsing the dashboard out of its count of
+// memories recalled by agents. A label, not a credential: it grants nothing.
+function auditClientLabel(req: Request): string | null {
+  const raw = req.headers['x-claude-mem-client'];
+  const value = (Array.isArray(raw) ? raw[0] : raw ?? '').trim().toLowerCase();
+  return /^[a-z0-9_-]{1,40}$/.test(value) ? value : null;
 }
 
 function parseEpochQuery(raw: unknown): Date | null {

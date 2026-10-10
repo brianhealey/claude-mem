@@ -371,6 +371,69 @@ describe('dashboard routes', () => {
     expect((await (await call('GET', '/v1/audit', otherTeamKey)).json() as Trail).entries).toHaveLength(0);
   });
 
+  it('GET /v1/value weighs generation and injection against what recall replaced', async () => {
+    // A 4,000-character tool output distilled into a 400-character memory.
+    const event = await storage.agentEvents.create({
+      projectId, teamId, sourceAdapter: 'api', eventType: 'tool_use', occurredAt: new Date(),
+      payload: { out: 'x'.repeat(4000 - '{"out": ""}'.length) },
+    });
+    const memory = await storage.observations.create({ projectId, teamId, content: `Zebra title\n${'y'.repeat(400 - 'Zebra title\n'.length)}` });
+    await storage.observationSources.addSource({
+      observationId: memory.id, projectId, teamId, sourceType: 'agent_event', sourceId: event.id, agentEventId: event.id,
+    });
+    const handwritten = await storage.observations.create({ projectId, teamId, content: 'zebra note with no source events' });
+    await client.query(
+      "INSERT INTO usage_events (id, team_id, project_id, kind, quantity) VALUES ('u1', $1, $2, 'tokens', 700)",
+      [teamId, projectId],
+    );
+
+    // An agent recalls both memories twice; a person browsing the dashboard
+    // runs the same search once, and a third search finds nothing.
+    await call('POST', '/v1/search', readKey, { projectId, query: 'zebra' });
+    await call('POST', '/v1/context', readKey, { projectId, query: 'zebra' });
+    await fetch(url('/v1/search'), {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${readKey}`, 'Content-Type': 'application/json', 'X-Claude-Mem-Client': 'dashboard' },
+      body: JSON.stringify({ projectId, query: 'zebra' }),
+    });
+    await call('POST', '/v1/search', readKey, { projectId, query: 'nothingmatchesthis' });
+    await call('GET', `/v1/memories?projectId=${projectId}`, readKey);
+
+    const r = await call('GET', `/v1/value?projectId=${projectId}&days=7`, readKey);
+    expect(r.status).toBe(200);
+    const body = await r.json() as {
+      windowDays: number; charsPerToken: number;
+      daily: Array<{ day: string; generationTokens: number; injectedTokens: number; replacedTokens: number; recalls: number }>;
+      totals: Record<string, number>; store: Record<string, number>;
+      topRecalled: Array<{ id: string; title: string; recalls: number }>;
+    };
+    expect(body.windowDays).toBe(7);
+    expect(body.daily).toHaveLength(7);
+    const handwrittenChars = 'zebra note with no source events'.length;
+    // Two recalls of each memory: injected is their own text, replaced is the
+    // source output for one and (having no source) its own text for the other.
+    expect(body.totals).toMatchObject({
+      generationTokens: 700,
+      injectedTokens: Math.round((2 * (400 + handwrittenChars)) / 4),
+      replacedTokens: Math.round((2 * (4000 + handwrittenChars)) / 4),
+      recalls: 2,
+      memoriesRecalled: 2,
+      searches: 2,
+      emptySearches: 1,
+    });
+    expect(body.totals.netTokens).toBe(body.totals.replacedTokens - body.totals.injectedTokens - 700);
+    // Everything happened today, the last day of the window.
+    expect(body.daily[6]).toMatchObject({ generationTokens: 700, recalls: 2 });
+    expect(body.daily.slice(0, 6).every(d => d.recalls === 0 && d.generationTokens === 0)).toBe(true);
+    expect(body.store.observations).toBe(2);
+    expect(body.store.compressionRatio).toBeCloseTo(4000 / (400 + handwrittenChars), 1);
+    expect(body.topRecalled.map(m => [m.id, m.recalls]).sort()).toEqual([[memory.id, 2], [handwritten.id, 2]].sort());
+    expect(body.topRecalled.find(m => m.id === memory.id)?.title).toBe('Zebra title');
+
+    expect((await call('GET', '/v1/value', readKey)).status).toBe(400);
+    expect((await call('GET', `/v1/value?projectId=${projectId}`, otherTeamKey)).status).toBe(403);
+  });
+
   describe('failed jobs', () => {
     const seedFailedJob = async (reason: string) => {
       const event = await storage.agentEvents.create({

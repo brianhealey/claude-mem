@@ -171,6 +171,38 @@
   .memory.fresh { border-color: var(--accent); }
   td.details { color: var(--dim); font-size: 13px; overflow-wrap: anywhere; }
 
+  /* value */
+  .chart {
+    --series-avoided: #2a78d6;
+    --series-spent: #eb6834;
+    position: relative;
+    border: 1px solid var(--line);
+    border-radius: 8px;
+    background: var(--panel);
+    padding: 14px 16px 8px;
+  }
+  @media (prefers-color-scheme: dark) {
+    .chart { --series-avoided: #3987e5; --series-spent: #d95926; }
+  }
+  .chart svg { display: block; width: 100%; height: auto; overflow: visible; }
+  .chart .legend { display: flex; gap: 18px; font-size: 13px; color: var(--dim); margin-bottom: 8px; flex-wrap: wrap; }
+  .chart .legend .key { display: inline-block; width: 10px; height: 10px; border-radius: 2px; margin-right: 6px; }
+  .chart .axis { fill: var(--dim); font-size: 11px; font-variant-numeric: tabular-nums; }
+  .chart .grid { stroke: var(--line); stroke-width: 1; }
+  .chart .hit { fill: transparent; }
+  .chart .hit:hover, .chart .hit:focus { fill: color-mix(in srgb, var(--fg) 6%, transparent); outline: none; }
+  .chart .tooltip {
+    position: absolute; pointer-events: none; z-index: 2; min-width: 190px;
+    background: var(--bg); border: 1px solid var(--line); border-radius: 6px;
+    padding: 8px 10px; font-size: 13px; box-shadow: 0 4px 14px rgba(0, 0, 0, 0.18);
+  }
+  .chart .tooltip .row { display: flex; gap: 8px; align-items: baseline; }
+  .chart .tooltip .stroke { display: inline-block; width: 12px; height: 3px; border-radius: 2px; align-self: center; }
+  .chart .tooltip strong { font-variant-numeric: tabular-nums; }
+  .chart .tooltip .label { color: var(--dim); }
+  .chart .empty { color: var(--dim); padding: 28px 0; text-align: center; }
+  .tile .sub { color: var(--dim); font-size: 12px; margin-top: 2px; }
+
   /* sessions */
   tr.clickable { cursor: pointer; }
   tr.clickable:hover td { background: var(--chip); }
@@ -211,6 +243,7 @@
       <button role="tab" data-tab="memories" aria-selected="true">Memories</button>
       <button role="tab" data-tab="sessions" aria-selected="false">Sessions</button>
       <button role="tab" data-tab="pipeline" aria-selected="false">Pipeline</button>
+      <button role="tab" data-tab="value" aria-selected="false">Value</button>
       <button role="tab" data-tab="keys" aria-selected="false">Keys</button>
       <button role="tab" data-tab="audit" aria-selected="false">Audit</button>
     </nav>
@@ -295,6 +328,34 @@
       <div class="tablewrap"><table id="failed-reasons"></table></div>
       <h2 id="failed-recent-title" hidden>Most recent failures</h2>
       <div class="tablewrap"><table id="failed"></table></div>
+    </section>
+
+    <section id="tab-value" hidden>
+      <div class="toolbar">
+        <select id="value-days" aria-label="Window">
+          <option value="7">Last 7 days</option>
+          <option value="30" selected>Last 30 days</option>
+          <option value="90">Last 90 days</option>
+        </select>
+        <p id="value-status" class="note grow"></p>
+      </div>
+      <p class="banner note">
+        <strong>Generation</strong> is measured: tokens the provider reported for writing memories.
+        <strong>Handed back</strong> and <strong>rediscovery avoided</strong> are estimates from text length
+        (<span id="value-rate">4</span> characters per token): the size of the memories agents were given, and the size of
+        the raw tool output those memories were distilled from. "Avoided" assumes the agent would otherwise have
+        redone that work, which cannot be checked here. Browsing this dashboard is not counted.
+      </p>
+      <div id="value-tiles" class="tiles"></div>
+      <h2>Tokens per day</h2>
+      <div id="value-chart" class="chart"></div>
+      <div class="toolbar"><button type="button" id="value-table-toggle" class="quiet">Show as table</button></div>
+      <div class="tablewrap"><table id="value-table" hidden></table></div>
+      <h2>How it is used</h2>
+      <div id="value-usage" class="tiles"></div>
+      <h2>Most recalled memories</h2>
+      <p id="value-top-status" class="note"></p>
+      <div class="tablewrap"><table id="value-top"></table></div>
     </section>
 
     <section id="tab-keys" hidden>
@@ -436,6 +497,7 @@
       method,
       headers: {
         Authorization: `Bearer ${state.apiKey}`,
+        'X-Claude-Mem-Client': 'dashboard',
         ...(body !== undefined ? { 'Content-Type': 'application/json' } : {}),
       },
       body: body !== undefined ? JSON.stringify(body) : undefined,
@@ -549,7 +611,8 @@
     for (const button of document.querySelectorAll('nav [role=tab]')) {
       button.setAttribute('aria-selected', String(button.dataset.tab === tab));
     }
-    for (const name of ['memories', 'sessions', 'pipeline', 'keys', 'audit']) $(`tab-${name}`).hidden = name !== tab;
+    for (const name of ['memories', 'sessions', 'pipeline', 'value', 'keys', 'audit']) $(`tab-${name}`).hidden = name !== tab;
+    if (tab === 'value') loadValue();
     if (tab === 'memories') {
       $('memory-new').hidden = !state.canWrite;
       Promise.all([loadSessions(), loadFolders()]).catch(showError);
@@ -1114,6 +1177,184 @@
       showError(error);
     }
   }
+
+  // ---- Value ----
+  const SVG_NS = 'http://www.w3.org/2000/svg';
+  function svg(tag, attrs, ...children) {
+    const node = document.createElementNS(SVG_NS, tag);
+    for (const [key, value] of Object.entries(attrs || {})) node.setAttribute(key, String(value));
+    node.append(...children);
+    return node;
+  }
+  const compact = value => {
+    const abs = Math.abs(value);
+    if (abs >= 1e6) return `${(value / 1e6).toFixed(abs >= 1e7 ? 0 : 1)}M`;
+    if (abs >= 1e3) return `${(value / 1e3).toFixed(abs >= 1e4 ? 0 : 1)}K`;
+    return String(value);
+  };
+  // A round number at or above `value`, so the top gridline is a clean tick.
+  function niceCeil(value) {
+    if (value <= 0) return 1;
+    const magnitude = 10 ** Math.floor(Math.log10(value));
+    // Steps whose quarters are themselves round, since the grid has four of them.
+    for (const step of [1, 2, 4, 6, 8, 10]) if (step * magnitude >= value) return step * magnitude;
+    return 10 * magnitude;
+  }
+  function formatAge(ms) {
+    if (ms === null || ms === undefined) return '—';
+    if (ms < 3600000) return `${Math.max(1, Math.round(ms / 60000))} min`;
+    if (ms < 86400000 * 2) return `${Math.round(ms / 3600000)} h`;
+    return `${Math.round(ms / 86400000)} days`;
+  }
+  function valueTile(label, value, sub, bad) {
+    const node = tile(label, value, bad);
+    if (sub) node.append(el('div', { class: 'sub', text: sub }));
+    return node;
+  }
+
+  // Two columns per day from one baseline: what memory cost that day (spent)
+  // and what recall plausibly saved (avoided). One axis, both in tokens.
+  function renderValueChart(daily) {
+    const host = clear($('value-chart'));
+    const max = Math.max(...daily.map(d => Math.max(d.generationTokens + d.injectedTokens, d.replacedTokens)));
+    if (max === 0) {
+      host.append(el('div', { class: 'empty', text: 'No generation or recall recorded in this window yet.' }));
+      return;
+    }
+    host.append(el('div', { class: 'legend' },
+      el('span', {}, el('span', { class: 'key', style: 'background: var(--series-spent)' }), 'Spent (generation + handed back)'),
+      el('span', {}, el('span', { class: 'key', style: 'background: var(--series-avoided)' }), 'Rediscovery avoided (estimate)'),
+    ));
+    const W = 960, H = 260, left = 44, right = 8, top = 8, bottom = 24;
+    const plotW = W - left - right, plotH = H - top - bottom;
+    const yMax = niceCeil(max);
+    const y = value => top + plotH - (value / yMax) * plotH;
+    const band = plotW / daily.length;
+    const gap = 2;
+    const barW = Math.max(1.5, Math.min(24, (band - gap) / 2 - 2));
+    const root = svg('svg', { viewBox: `0 0 ${W} ${H}`, role: 'img', 'aria-label': 'Tokens spent and estimated tokens avoided per day' });
+    for (const fraction of [0, 0.25, 0.5, 0.75, 1]) {
+      const yy = y(yMax * fraction);
+      root.append(
+        svg('line', { class: 'grid', x1: left, x2: W - right, y1: yy, y2: yy }),
+        svg('text', { class: 'axis', x: left - 6, y: yy + 4, 'text-anchor': 'end' }, compact(Math.round(yMax * fraction))),
+      );
+    }
+    // A column with a rounded data end and a square foot on the baseline.
+    const column = (x, value, color) => {
+      const height = (value / yMax) * plotH;
+      if (height <= 0) return null;
+      const radius = Math.min(4, barW / 2, height);
+      const base = top + plotH, tip = base - height;
+      return svg('path', {
+        fill: `var(${color})`,
+        d: `M${x},${base} V${tip + radius} Q${x},${tip} ${x + radius},${tip} H${x + barW - radius} Q${x + barW},${tip} ${x + barW},${tip + radius} V${base} Z`,
+      });
+    };
+    const tooltip = el('div', { class: 'tooltip', hidden: true });
+    const labelEvery = Math.ceil(daily.length / 8);
+    daily.forEach((day, index) => {
+      const x0 = left + index * band;
+      const start = x0 + (band - (barW * 2 + gap)) / 2;
+      const spent = day.generationTokens + day.injectedTokens;
+      const bars = [column(start, spent, '--series-spent'), column(start + barW + gap, day.replacedTokens, '--series-avoided')].filter(Boolean);
+      root.append(...bars);
+      if (index % labelEvery === 0) {
+        root.append(svg('text', { class: 'axis', x: x0 + band / 2, y: H - 6, 'text-anchor': 'middle' }, day.day.slice(5)));
+      }
+      const hit = svg('rect', { class: 'hit', x: x0, y: top, width: band, height: plotH, tabindex: 0, 'aria-label': `${day.day}: spent ${spent}, avoided ${day.replacedTokens}` });
+      const show = () => {
+        clear(tooltip).append(
+          el('div', { class: 'label', text: new Date(`${day.day}T00:00:00Z`).toLocaleDateString(undefined, { dateStyle: 'medium', timeZone: 'UTC' }) }),
+          el('div', { class: 'row' }, el('span', { class: 'stroke', style: 'background: var(--series-spent)' }), el('strong', { text: formatCount(spent) }), el('span', { class: 'label', text: 'spent' })),
+          el('div', { class: 'row label', text: `${formatCount(day.generationTokens)} generating · ${formatCount(day.injectedTokens)} handed back` }),
+          el('div', { class: 'row' }, el('span', { class: 'stroke', style: 'background: var(--series-avoided)' }), el('strong', { text: formatCount(day.replacedTokens) }), el('span', { class: 'label', text: 'avoided (estimate)' })),
+          el('div', { class: 'row label', text: `${day.recalls} recall${day.recalls === 1 ? '' : 's'}` }),
+        );
+        tooltip.hidden = false;
+        const centre = ((x0 + band / 2) / W) * host.clientWidth;
+        // Beside the hovered day, on whichever side has room, so it never
+        // covers the columns it describes.
+        const bandPx = (band / W) * host.clientWidth;
+        const width = tooltip.offsetWidth;
+        tooltip.style.left = `${centre < host.clientWidth / 2 ? centre + bandPx / 2 + 8 : centre - bandPx / 2 - 8 - width}px`;
+        tooltip.style.top = '40px';
+      };
+      const hide = () => { tooltip.hidden = true; };
+      hit.addEventListener('pointerenter', show);
+      hit.addEventListener('focus', show);
+      hit.addEventListener('pointerleave', hide);
+      hit.addEventListener('blur', hide);
+      root.append(hit);
+    });
+    root.append(svg('line', { class: 'grid', x1: left, x2: W - right, y1: top + plotH, y2: top + plotH }));
+    host.append(root, tooltip);
+  }
+
+  async function loadValue() {
+    const status = $('value-status');
+    status.textContent = 'Loading…';
+    clearError();
+    try {
+      const params = new URLSearchParams({ projectId: state.projectId, days: $('value-days').value });
+      const value = await api('GET', `/v1/value?${params}`);
+      const t = value.totals;
+      $('value-rate').textContent = String(value.charsPerToken);
+      status.textContent = `Since ${new Date(value.since).toLocaleDateString(undefined, { dateStyle: 'medium', timeZone: 'UTC' })} (UTC days)`
+        + (value.truncated ? ' · recall history truncated, figures are a lower bound' : '');
+
+      clear($('value-tiles')).append(
+        valueTile('Spent generating', formatCount(t.generationTokens), 'measured'),
+        valueTile('Handed back to agents', formatCount(t.injectedTokens), 'estimate'),
+        valueTile('Rediscovery avoided', formatCount(t.replacedTokens), 'estimate'),
+        valueTile('Net', `${t.netTokens > 0 ? '+' : ''}${formatCount(t.netTokens)}`, 'avoided − handed back − generating', t.netTokens < 0),
+      );
+      renderValueChart(value.daily);
+
+      const table = clear($('value-table'));
+      table.append(headerRow('Day (UTC)', 'Generating', 'Handed back', 'Avoided', 'Recalls'));
+      for (const day of [...value.daily].reverse()) {
+        table.append(el('tr', {},
+          el('td', { text: day.day }),
+          ...[day.generationTokens, day.injectedTokens, day.replacedTokens, day.recalls].map(n => el('td', { class: 'num', text: formatCount(n) })),
+        ));
+      }
+
+      const store = value.store;
+      const hitRate = t.searches > 0 ? `${Math.round(((t.searches - t.emptySearches) / t.searches) * 100)}%` : '—';
+      clear($('value-usage')).append(
+        valueTile('Compression', store.compressionRatio ? `${store.compressionRatio} : 1` : '—',
+          `${compact(store.eventTokens)} of tool output → ${compact(store.observationTokens)} of memory`),
+        valueTile('Recalls', formatCount(t.recalls), 'times an agent was handed memories'),
+        valueTile('Memories recalled', `${formatCount(t.memoriesRecalled)} of ${formatCount(store.observations)}`,
+          store.observations > 0 ? `${Math.round((t.memoriesRecalled / store.observations) * 100)}% used at least once` : ''),
+        valueTile('Searches that found something', hitRate, `${formatCount(t.searches)} search${t.searches === 1 ? '' : 'es'}`),
+        valueTile('Typical age when recalled', formatAge(value.medianAgeAtRecallMs), 'median; older means reuse across sessions'),
+      );
+
+      const top = clear($('value-top'));
+      top.hidden = value.topRecalled.length === 0;
+      $('value-top-status').textContent = value.topRecalled.length === 0 ? 'No memory has been recalled in this window.' : '';
+      if (value.topRecalled.length > 0) top.append(headerRow('Memory', 'Kind', 'Recalls', 'Last recalled'));
+      for (const memory of value.topRecalled) {
+        top.append(el('tr', {},
+          el('td', { text: memory.title || '(empty)' }),
+          el('td', {}, el('span', { class: 'chip', text: memory.kind })),
+          el('td', { class: 'num', text: formatCount(memory.recalls) }),
+          el('td', { text: formatWhen(memory.lastRecalledAtEpoch) }),
+        ));
+      }
+    } catch (error) {
+      status.textContent = '';
+      showError(error);
+    }
+  }
+  $('value-days').addEventListener('change', loadValue);
+  $('value-table-toggle').addEventListener('click', () => {
+    const table = $('value-table');
+    table.hidden = !table.hidden;
+    $('value-table-toggle').textContent = table.hidden ? 'Show as table' : 'Hide table';
+  });
 
   // Requeue failed jobs in bulk. The server caps each call, so keep calling
   // while it reports more remaining.
