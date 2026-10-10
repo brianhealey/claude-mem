@@ -215,6 +215,132 @@ describe('dashboard routes', () => {
       counts: { queued: 0, processing: 0, completed: 0, failed: 0, cancelled: 0 },
       lastCompletedAtEpoch: null,
       lastFailedAtEpoch: null,
+      failedByReason: [],
+      lastGeneration: null,
+      captureToMemory: { medianMs: null, sampleSize: 0 },
+    });
+  });
+
+  it('GET /v1/folders counts observations per folder and kind', async () => {
+    await storage.observations.create({ projectId, teamId, content: 'a', kind: 'bugfix', metadata: { project: 'cluster' } });
+    await storage.observations.create({ projectId, teamId, content: 'b', kind: 'bugfix', metadata: { project: 'cluster' } });
+    await storage.observations.create({ projectId, teamId, content: 'c', kind: 'decision', metadata: { project: 'claude-mem' } });
+    await storage.observations.create({ projectId, teamId, content: 'd', kind: 'decision' });
+    const r = await call('GET', `/v1/folders?projectId=${projectId}`, readKey);
+    expect(r.status).toBe(200);
+    const body = await r.json() as {
+      folders: Array<{ folder: string | null; observationCount: number }>;
+      kinds: Array<{ kind: string; observationCount: number }>;
+    };
+    const byFolder = Object.fromEntries(body.folders.map(f => [String(f.folder), f.observationCount]));
+    expect(byFolder).toEqual({ cluster: 2, 'claude-mem': 1, null: 1 });
+    expect(Object.fromEntries(body.kinds.map(k => [k.kind, k.observationCount]))).toEqual({ bugfix: 2, decision: 2 });
+    expect((await call('GET', '/v1/folders', readKey)).status).toBe(400);
+  });
+
+  it('GET /v1/memories filters by folder (ASCII case-insensitive) and by kind', async () => {
+    await storage.observations.create({ projectId, teamId, content: 'cluster bug', kind: 'bugfix', metadata: { project: 'Cluster' } });
+    await storage.observations.create({ projectId, teamId, content: 'cluster decision', kind: 'decision', metadata: { project: 'cluster' } });
+    await storage.observations.create({ projectId, teamId, content: 'other bug', kind: 'bugfix', metadata: { project: 'claude-mem' } });
+    type Page = { observations: Array<{ content: string }> };
+    const inFolder = await (await call('GET', `/v1/memories?projectId=${projectId}&folder=cluster`, readKey)).json() as Page;
+    expect(inFolder.observations.map(o => o.content).sort()).toEqual(['cluster bug', 'cluster decision']);
+    const both = await (await call('GET', `/v1/memories?projectId=${projectId}&folder=cluster&kind=bugfix`, readKey)).json() as Page;
+    expect(both.observations.map(o => o.content)).toEqual(['cluster bug']);
+  });
+
+  it('GET /v1/sessions/:id/events lists events with the observations made from them', async () => {
+    const session = await storage.sessions.create({ projectId, teamId, contentSessionId: 'content-1' });
+    const first = await storage.agentEvents.create({
+      projectId, teamId, serverSessionId: session.id, sourceAdapter: 'api', eventType: 'tool_use',
+      payload: { tool_name: 'Bash', tool_input: { command: 'secret-looking input' } }, occurredAt: new Date(1_700_000_000_000),
+    });
+    const second = await storage.agentEvents.create({
+      projectId, teamId, serverSessionId: session.id, sourceAdapter: 'api', eventType: 'tool_use',
+      payload: { tool_name: 'Edit' }, occurredAt: new Date(1_700_000_001_000),
+    });
+    const observation = await storage.observations.create({ projectId, teamId, content: 'from bash', serverSessionId: session.id });
+    await storage.observationSources.addSource({
+      observationId: observation.id, projectId, teamId, sourceType: 'agent_event', sourceId: first.id, agentEventId: first.id,
+    });
+
+    const r = await call('GET', `/v1/sessions/${session.id}/events`, readKey);
+    expect(r.status).toBe(200);
+    const raw = await r.text();
+    // Payloads stay out of the listing.
+    expect(raw).not.toContain('secret-looking input');
+    const { events, hasMore } = JSON.parse(raw) as { events: Array<Record<string, unknown>>; hasMore: boolean };
+    expect(hasMore).toBe(false);
+    expect(events.map(e => [e.id, e.toolName, e.observationIds])).toEqual([
+      [first.id, 'Bash', [observation.id]],
+      [second.id, 'Edit', []],
+    ]);
+    const listed = await (await call('GET', `/v1/sessions?projectId=${projectId}`, readKey)).json() as { sessions: Array<{ eventCount: number }> };
+    expect(listed.sessions[0].eventCount).toBe(2);
+    // Another team cannot read this session's events.
+    expect((await call('GET', `/v1/sessions/${session.id}/events`, otherTeamKey)).status).toBe(404);
+  });
+
+  describe('failed jobs', () => {
+    const seedFailedJob = async (reason: string) => {
+      const event = await storage.agentEvents.create({
+        projectId, teamId, sourceAdapter: 'api', eventType: 'tool_use', payload: { n: randomUUID() }, occurredAt: new Date(),
+      });
+      const job = await storage.observationGenerationJobs.create({
+        projectId, teamId, sourceType: 'agent_event', sourceId: event.id, agentEventId: event.id,
+        jobType: 'observation_generate_for_event', bullmqJobId: `evt_${event.id}`,
+      });
+      await client.query(
+        `UPDATE observation_generation_jobs
+            SET status = 'failed', failed_at = now(), attempts = max_attempts, last_error = $2::jsonb
+          WHERE id = $1`,
+        [job.id, JSON.stringify({ reason })],
+      );
+      return job.id;
+    };
+
+    it('GET /v1/jobs/summary groups failures by reason', async () => {
+      await seedFailedJob('quota exhausted');
+      await seedFailedJob('quota exhausted');
+      await seedFailedJob('upstream 503');
+      const body = await (await call('GET', '/v1/jobs/summary', readKey)).json() as {
+        counts: Record<string, number>; failedByReason: Array<{ reason: string; count: number }>;
+      };
+      expect(body.counts.failed).toBe(3);
+      expect(body.failedByReason).toEqual([
+        { reason: 'quota exhausted', count: 2 },
+        { reason: 'upstream 503', count: 1 },
+      ]);
+    });
+
+    it('POST /v1/jobs/retry-failed requeues failed jobs, optionally for one reason', async () => {
+      const quotaA = await seedFailedJob('quota exhausted');
+      const quotaB = await seedFailedJob('quota exhausted');
+      const upstream = await seedFailedJob('upstream 503');
+      const statusOf = async (id: string) =>
+        (await client.query<{ status: string; attempts: number; max_attempts: number }>(
+          'SELECT status, attempts, max_attempts FROM observation_generation_jobs WHERE id = $1', [id])).rows[0];
+
+      expect([401, 403]).toContain((await call('POST', '/v1/jobs/retry-failed', readKey, {})).status);
+
+      const scoped = await call('POST', '/v1/jobs/retry-failed', writeKey, { reason: 'quota exhausted' });
+      expect(scoped.status).toBe(200);
+      expect(await scoped.json()).toMatchObject({ requeued: 2, remaining: false });
+      expect((await statusOf(quotaA)).status).toBe('queued');
+      expect((await statusOf(quotaB)).status).toBe('queued');
+      expect((await statusOf(upstream)).status).toBe('failed');
+      // Like the single retry, it leaves room for one more attempt.
+      const retried = await statusOf(quotaA);
+      expect(retried.attempts).toBe(retried.max_attempts - 1);
+
+      const rest = await (await call('POST', '/v1/jobs/retry-failed', writeKey, {})).json() as { requeued: number };
+      expect(rest.requeued).toBe(1);
+      expect((await statusOf(upstream)).status).toBe('queued');
+      // Nothing left to retry.
+      expect(await (await call('POST', '/v1/jobs/retry-failed', writeKey, {})).json()).toMatchObject({ requeued: 0 });
+      // The other team's key requeues nothing of ours.
+      await seedFailedJob('again');
+      expect(await (await call('POST', '/v1/jobs/retry-failed', otherTeamKey, {})).json()).toMatchObject({ requeued: 0 });
     });
   });
 });

@@ -91,6 +91,7 @@
   main { max-width: 1040px; margin: 0 auto; padding: 24px; }
   .toolbar { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 16px; }
   .toolbar .grow { flex: 1 1 240px; }
+  .toolbar p { margin: 0; align-self: center; }
   .note { color: var(--dim); }
   .error { color: var(--bad); }
   .banner { border: 1px solid var(--line); border-radius: 8px; background: var(--panel); padding: 12px 16px; margin-bottom: 16px; }
@@ -159,6 +160,20 @@
   td.actions { text-align: right; white-space: nowrap; }
   .tablewrap { overflow-x: auto; }
 
+  /* sessions */
+  tr.clickable { cursor: pointer; }
+  tr.clickable:hover td { background: var(--chip); }
+  .event { border-left: 2px solid var(--line); margin: 0 0 4px 6px; padding: 4px 0 4px 14px; }
+  .event.has-memory { border-left-color: var(--accent); }
+  .event .line { display: flex; gap: 10px; align-items: baseline; flex-wrap: wrap; color: var(--dim); font-size: 13px; }
+  .event .line .tool { color: var(--fg); font-weight: 600; }
+  .event .memory { margin: 8px 0 4px; }
+  .event pre.raw {
+    white-space: pre-wrap; overflow-wrap: anywhere; max-height: 320px; overflow: auto;
+    background: var(--chip); border-radius: 6px; padding: 10px 12px; margin: 8px 0;
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px;
+  }
+
   /* keys */
   .minted { border: 1px solid var(--accent); border-radius: 8px; background: var(--panel); padding: 14px 16px; margin-bottom: 16px; }
   .minted .secret { display: flex; gap: 8px; align-items: center; margin: 8px 0; }
@@ -183,6 +198,7 @@
     <h1>claude-mem <span>server</span></h1>
     <nav role="tablist">
       <button role="tab" data-tab="memories" aria-selected="true">Memories</button>
+      <button role="tab" data-tab="sessions" aria-selected="false">Sessions</button>
       <button role="tab" data-tab="pipeline" aria-selected="false">Pipeline</button>
       <button role="tab" data-tab="keys" aria-selected="false">Keys</button>
     </nav>
@@ -198,6 +214,8 @@
     <section id="tab-memories">
       <form id="search-form" class="toolbar">
         <input id="search-query" class="grow" type="search" placeholder="Search memories" aria-label="Search memories">
+        <select id="folder-filter" aria-label="Folder"></select>
+        <select id="kind-filter" aria-label="Kind"></select>
         <select id="session-filter" aria-label="Session"></select>
         <button type="submit">Search</button>
         <button type="button" id="search-clear" class="quiet" hidden>Clear</button>
@@ -207,13 +225,39 @@
       <button id="memories-more" hidden>Load more</button>
     </section>
 
+    <section id="tab-sessions" hidden>
+      <div id="sessions-list">
+        <p id="sessions-status" class="note"></p>
+        <div class="tablewrap"><table id="sessions"></table></div>
+      </div>
+      <div id="session-detail" hidden>
+        <div class="toolbar">
+          <button type="button" id="session-back">← All sessions</button>
+        </div>
+        <div id="session-head" class="banner"></div>
+        <div id="session-summary"></div>
+        <h2>Timeline</h2>
+        <p id="session-status" class="note"></p>
+        <div id="session-timeline"></div>
+        <button id="session-more" hidden>Load more events</button>
+      </div>
+    </section>
+
     <section id="tab-pipeline" hidden>
       <div id="pipeline-health" class="banner"></div>
       <div id="pipeline-tiles" class="tiles"></div>
+      <h2>Usage</h2>
+      <p id="usage-status" class="note"></p>
+      <div id="usage-tiles" class="tiles"></div>
       <h2>Queue lanes</h2>
       <div class="tablewrap"><table id="lanes"></table></div>
       <h2>Failed jobs</h2>
-      <p id="failed-status" class="note"></p>
+      <div class="toolbar">
+        <p id="failed-status" class="note grow"></p>
+        <button type="button" id="retry-all" hidden>Retry all failed</button>
+      </div>
+      <div class="tablewrap"><table id="failed-reasons"></table></div>
+      <h2 id="failed-recent-title" hidden>Most recent failures</h2>
       <div class="tablewrap"><table id="failed"></table></div>
     </section>
 
@@ -257,6 +301,7 @@
     tab: 'memories',
     offset: 0,
     query: '',
+    memoriesRun: 0,
     pipelineTimer: null,
   };
 
@@ -287,6 +332,12 @@
     return date.toLocaleString(undefined, { dateStyle: 'medium', timeStyle: 'short' });
   }
   const shortId = id => (id ? String(id).slice(0, 8) : '—');
+  const formatCount = value => Number(value).toLocaleString();
+  function formatDuration(ms) {
+    if (ms < 1000) return `${ms} ms`;
+    if (ms < 90000) return `${Math.round(ms / 1000)} s`;
+    return `${Math.round(ms / 60000)} min`;
+  }
 
   // ---- API ----
   class ApiError extends Error {
@@ -408,8 +459,12 @@
     for (const button of document.querySelectorAll('nav [role=tab]')) {
       button.setAttribute('aria-selected', String(button.dataset.tab === tab));
     }
-    for (const name of ['memories', 'pipeline', 'keys']) $(`tab-${name}`).hidden = name !== tab;
-    if (tab === 'memories') { loadSessions().catch(showError); reloadMemories(); }
+    for (const name of ['memories', 'sessions', 'pipeline', 'keys']) $(`tab-${name}`).hidden = name !== tab;
+    if (tab === 'memories') {
+      Promise.all([loadSessions(), loadFolders()]).catch(showError);
+      reloadMemories();
+    }
+    if (tab === 'sessions') loadSessionList();
     if (tab === 'pipeline') {
       loadPipeline();
       state.pipelineTimer = setInterval(() => { if (!document.hidden) loadPipeline(); }, PIPELINE_REFRESH_MS);
@@ -437,6 +492,21 @@
     if ([...select.options].some(option => option.value === previous)) select.value = previous;
   }
 
+  // Folder and kind dropdowns, with counts. A server project usually holds
+  // several working folders; these are how a reader narrows it to one.
+  async function loadFolders() {
+    const { folders, kinds } = await api('GET', `/v1/folders?projectId=${encodeURIComponent(state.projectId)}`);
+    const fill = (select, allLabel, rows) => {
+      const previous = select.value;
+      clear(select).append(el('option', { value: '', text: allLabel }));
+      for (const row of rows) select.append(el('option', { value: row.value, text: `${row.value} (${row.count})` }));
+      if ([...select.options].some(option => option.value === previous)) select.value = previous;
+      select.hidden = rows.length < 2;
+    };
+    fill($('folder-filter'), 'All folders', folders.filter(f => f.folder).map(f => ({ value: f.folder, count: f.observationCount })));
+    fill($('kind-filter'), 'All kinds', kinds.map(k => ({ value: k.kind, count: k.observationCount })));
+  }
+
   function memoryCard(observation) {
     const [firstLine, ...rest] = String(observation.content || '').split('\n');
     const bodyText = rest.join('\n').trim();
@@ -445,7 +515,10 @@
     const row = el('button', { class: 'row', type: 'button', 'aria-expanded': 'false' },
       el('span', { class: 'chip', text: observation.kind || 'memory' }),
       el('span', { class: 'title', text: firstLine || '(empty)' }),
-      el('span', { class: 'when', text: formatWhen(observation.createdAtEpoch) }),
+      el('span', { class: 'when', text: [
+        observation.metadata && observation.metadata.project,
+        formatWhen(observation.createdAtEpoch),
+      ].filter(Boolean).join(' · ') }),
     );
     row.addEventListener('click', () => {
       body.hidden = !body.hidden;
@@ -469,6 +542,9 @@
 
   async function reloadMemories() {
     state.offset = 0;
+    // Two filters changed in quick succession start two loads; only the
+    // newest may render, or its rows land under the older one's.
+    state.memoriesRun += 1;
     clear($('memories'));
     await loadMemories();
   }
@@ -480,18 +556,27 @@
     more.hidden = true;
     if (!state.projectId) { status.textContent = 'This key has no project yet.'; return; }
     status.textContent = 'Loading…';
+    const run = state.memoriesRun;
     try {
       let observations;
       let hasMore = false;
       if (state.query) {
         ({ observations } = await api('POST', '/v1/search', { projectId: state.projectId, query: state.query, limit: 100 }));
+        // /v1/search has no filters of its own, so narrow its results here.
         const sessionId = $('session-filter').value;
+        const folder = $('folder-filter').value.toLowerCase();
+        const kind = $('kind-filter').value;
         if (sessionId) observations = observations.filter(o => o.serverSessionId === sessionId);
+        if (folder) observations = observations.filter(o => String((o.metadata && o.metadata.project) || '').toLowerCase() === folder);
+        if (kind) observations = observations.filter(o => o.kind === kind);
       } else {
         const params = new URLSearchParams({ projectId: state.projectId, limit: String(PAGE_SIZE), offset: String(state.offset) });
         if ($('session-filter').value) params.set('serverSessionId', $('session-filter').value);
+        if ($('folder-filter').value) params.set('folder', $('folder-filter').value);
+        if ($('kind-filter').value) params.set('kind', $('kind-filter').value);
         ({ observations, hasMore } = await api('GET', `/v1/memories?${params}`));
       }
+      if (run !== state.memoriesRun) return;
       const list = $('memories');
       for (const observation of observations) list.append(memoryCard(observation));
       state.offset += observations.length;
@@ -501,6 +586,7 @@
         ? (state.query ? `Nothing matches “${state.query}”.` : 'No memories yet. They appear here as sessions are captured.')
         : (state.query ? `${shown} result${shown === 1 ? '' : 's'} for “${state.query}”` : `Showing ${shown} most recent`);
     } catch (error) {
+      if (run !== state.memoriesRun) return;
       status.textContent = '';
       showError(error);
     }
@@ -518,8 +604,132 @@
     $('search-clear').hidden = true;
     reloadMemories();
   });
-  $('session-filter').addEventListener('change', reloadMemories);
+  for (const id of ['session-filter', 'folder-filter', 'kind-filter']) $(id).addEventListener('change', reloadMemories);
   $('memories-more').addEventListener('click', loadMemories);
+
+  // ---- Sessions ----
+  const sessionView = { id: null, offset: 0, observations: new Map() };
+
+  async function loadSessionList() {
+    $('session-detail').hidden = true;
+    $('sessions-list').hidden = false;
+    const status = $('sessions-status');
+    status.textContent = 'Loading…';
+    try {
+      const { sessions } = await api('GET', `/v1/sessions?projectId=${encodeURIComponent(state.projectId)}&limit=200`);
+      const table = clear($('sessions'));
+      table.hidden = sessions.length === 0;
+      status.textContent = sessions.length === 0 ? 'No sessions captured yet.' : `${sessions.length} session${sessions.length === 1 ? '' : 's'}, newest first`;
+      if (sessions.length > 0) table.append(headerRow('Started', 'Folder', 'Source', 'Status', 'Events', 'Memories'));
+      for (const session of sessions) {
+        const row = el('tr', { class: 'clickable', tabindex: '0' },
+          el('td', { text: formatWhen(session.startedAtEpoch) }),
+          el('td', { text: session.folder || '—' }),
+          el('td', { text: session.platformSource || '—' }),
+          el('td', {}, el('span', { class: 'chip', text: session.endedAtEpoch ? 'ended' : 'open' })),
+          el('td', { class: 'num', text: String(session.eventCount) }),
+          el('td', { class: 'num', text: String(session.observationCount) }),
+        );
+        const open = () => openSession(session);
+        row.addEventListener('click', open);
+        row.addEventListener('keydown', event => { if (event.key === 'Enter') open(); });
+        table.append(row);
+      }
+    } catch (error) {
+      status.textContent = '';
+      showError(error);
+    }
+  }
+
+  async function openSession(session) {
+    Object.assign(sessionView, { id: session.id, offset: 0, observations: new Map() });
+    $('sessions-list').hidden = true;
+    $('session-detail').hidden = false;
+    clearError();
+    clear($('session-head')).append(
+      el('strong', { text: session.folder || 'Session' }),
+      ' ',
+      el('span', { class: 'chip', text: session.endedAtEpoch ? 'ended' : 'open' }),
+      el('div', { class: 'note', text: [
+        `Started ${new Date(session.startedAtEpoch).toLocaleString()}`,
+        session.endedAtEpoch ? `ended ${new Date(session.endedAtEpoch).toLocaleString()}` : null,
+        session.platformSource,
+        `${session.eventCount} events`,
+        `${session.observationCount} memories`,
+      ].filter(Boolean).join(' · ') }),
+      el('div', { class: 'note mono', text: `session ${session.contentSessionId || session.id}` }),
+    );
+    clear($('session-summary'));
+    clear($('session-timeline'));
+    $('session-status').textContent = 'Loading…';
+    try {
+      // Every observation of the session, so the timeline can hang each one
+      // under the event it was generated from.
+      const params = new URLSearchParams({ projectId: state.projectId, serverSessionId: session.id, limit: '200' });
+      const { observations } = await api('GET', `/v1/memories?${params}`);
+      for (const observation of observations) sessionView.observations.set(observation.id, observation);
+      await loadSessionEvents();
+    } catch (error) {
+      $('session-status').textContent = '';
+      showError(error);
+    }
+  }
+
+  function eventRow(event) {
+    const memories = event.observationIds.map(id => sessionView.observations.get(id)).filter(Boolean);
+    for (const memory of memories) memory.placed = true;
+    const node = el('div', { class: memories.length ? 'event has-memory' : 'event' });
+    const raw = el('pre', { class: 'raw', hidden: true });
+    const toggle = el('button', { class: 'quiet', type: 'button', text: 'Show raw event' });
+    toggle.addEventListener('click', async () => {
+      if (!raw.hidden) { raw.hidden = true; toggle.textContent = 'Show raw event'; return; }
+      if (!raw.textContent) {
+        toggle.disabled = true;
+        try {
+          const { event: full } = await api('GET', `/v1/events/${encodeURIComponent(event.id)}`);
+          raw.textContent = JSON.stringify(full.payload, null, 2);
+        } catch (error) { showError(error); toggle.disabled = false; return; }
+        toggle.disabled = false;
+      }
+      raw.hidden = false;
+      toggle.textContent = 'Hide raw event';
+    });
+    node.append(
+      el('div', { class: 'line' },
+        el('span', { text: new Date(event.occurredAtEpoch).toLocaleTimeString() }),
+        el('span', { class: 'tool', text: event.toolName || event.eventType }),
+        event.toolName ? el('span', { text: event.eventType }) : null,
+        memories.length === 0 ? el('span', { text: 'no memory' }) : null,
+        toggle,
+      ),
+      raw,
+    );
+    for (const memory of memories) node.append(memoryCard(memory));
+    return node;
+  }
+
+  async function loadSessionEvents() {
+    const params = new URLSearchParams({ limit: '200', offset: String(sessionView.offset) });
+    const { events, hasMore } = await api('GET', `/v1/sessions/${encodeURIComponent(sessionView.id)}/events?${params}`);
+    const timeline = $('session-timeline');
+    for (const event of events) timeline.append(eventRow(event));
+    sessionView.offset += events.length;
+    $('session-more').hidden = !hasMore;
+
+    // Whatever no event claimed — the session summary, memories written by
+    // hand — goes above the timeline, summary first.
+    const loose = [...sessionView.observations.values()].filter(o => !o.placed)
+      .sort((a, b) => (b.kind === 'summary') - (a.kind === 'summary') || a.createdAtEpoch - b.createdAtEpoch);
+    const summary = clear($('session-summary'));
+    if (!hasMore) for (const observation of loose) summary.append(memoryCard(observation));
+    const withMemory = timeline.querySelectorAll('.event.has-memory').length;
+    $('session-status').textContent = sessionView.offset === 0
+      ? 'No events were captured for this session.'
+      : `${sessionView.offset} event${sessionView.offset === 1 ? '' : 's'}, oldest first · ${withMemory} produced a memory`;
+  }
+
+  $('session-back').addEventListener('click', loadSessionList);
+  $('session-more').addEventListener('click', () => loadSessionEvents().catch(showError));
 
   // ---- Pipeline ----
   function tile(label, value, bad) {
@@ -534,10 +744,11 @@
 
   async function loadPipeline() {
     try {
-      const [info, summary, failed] = await Promise.all([
+      const [info, summary, failed, usage] = await Promise.all([
         fetch('/v1/info').then(response => response.json()),
         api('GET', '/v1/jobs/summary'),
         api('GET', '/v1/jobs?status=failed&limit=25'),
+        api('GET', '/v1/usage'),
       ]);
       clearError();
 
@@ -550,9 +761,13 @@
         el('span', { class: `chip ${queueOk ? 'ok' : 'bad'}`, text: queueOk ? 'queue connected' : `queue ${queue.status || 'unknown'}` }),
         ' ',
         el('span', { class: 'note', text: [
-          `Last completed ${formatWhen(summary.lastCompletedAtEpoch)}`,
+          summary.lastGeneration ? `Generating with ${[summary.lastGeneration.provider, summary.lastGeneration.model].filter(Boolean).join(' · ')}` : 'No generation yet',
+          `last completed ${formatWhen(summary.lastCompletedAtEpoch)}`,
           `last failed ${formatWhen(summary.lastFailedAtEpoch)}`,
-        ].join(' · ') }),
+          summary.captureToMemory.medianMs !== null
+            ? `capture to memory ${formatDuration(summary.captureToMemory.medianMs)} median over last ${summary.captureToMemory.sampleSize}`
+            : null,
+        ].filter(Boolean).join(' · ') }),
       );
       if (stuck) {
         health.append(el('div', { class: 'error', text: 'Jobs are queued in the database but the queue is empty. The server and the generation worker may be on different queue prefixes.' }));
@@ -566,6 +781,23 @@
         tile('Cancelled', summary.counts.cancelled),
       );
 
+      const month = usage.usage || {};
+      const today = usage.today || {};
+      const metered = Object.keys(month).length > 0;
+      $('usage-status').textContent = metered
+        ? 'Today and this calendar month, UTC.'
+        : 'Nothing recorded this month. Token and observation counts are only kept when the generation worker runs with CLAUDE_MEM_USAGE_METERING=1.';
+      const usageTiles = clear($('usage-tiles'));
+      usageTiles.hidden = !metered;
+      if (metered) {
+        usageTiles.append(
+          tile('Tokens today', formatCount(today.tokens || 0)),
+          tile('Tokens this month', formatCount(month.tokens || 0)),
+          tile('Memories today', formatCount(today.observation || 0)),
+          tile('Memories this month', formatCount(month.observation || 0)),
+        );
+      }
+
       const laneTable = clear($('lanes'));
       laneTable.append(headerRow('Lane', 'Waiting', 'Active', 'Delayed', 'Failed'));
       if (lanes.length === 0) laneTable.append(el('tr', {}, el('td', { colspan: '5', class: 'note', text: 'No queue lanes reported.' })));
@@ -577,9 +809,29 @@
         ));
       }
 
+      const failedCount = summary.counts.failed;
+      $('failed-status').textContent = failedCount === 0 ? 'No failed jobs.' : `${failedCount} failed, grouped by reason.`;
+      $('retry-all').hidden = !(state.canWrite && failedCount > 0);
+      const reasonTable = clear($('failed-reasons'));
+      reasonTable.hidden = summary.failedByReason.length === 0;
+      if (summary.failedByReason.length > 0) reasonTable.append(headerRow('Reason', 'Jobs', ''));
+      for (const group of summary.failedByReason) {
+        const actions = el('td', { class: 'actions' });
+        if (state.canWrite && group.reason) {
+          const retry = el('button', { type: 'button', text: 'Retry these' });
+          retry.addEventListener('click', () => retryFailed(retry, group.reason));
+          actions.append(retry);
+        }
+        reasonTable.append(el('tr', {},
+          el('td', { text: group.reason || 'No reason recorded' }),
+          el('td', { class: 'num', text: String(group.count) }),
+          actions,
+        ));
+      }
+
       const failedTable = clear($('failed'));
-      $('failed-status').textContent = failed.total === 0 ? 'No failed jobs.' : `${failed.total} failed. Showing the most recent ${failed.jobs.length}.`;
       failedTable.hidden = failed.jobs.length === 0;
+      $('failed-recent-title').hidden = failed.jobs.length === 0;
       if (failed.jobs.length > 0) failedTable.append(headerRow('Failed', 'Source', 'Attempts', 'Reason', ''));
       for (const job of failed.jobs) {
         const reason = job.lastError && (job.lastError.reason || job.lastError.message) || '—';
@@ -606,6 +858,30 @@
       showError(error);
     }
   }
+
+  // Requeue failed jobs in bulk. The server caps each call, so keep calling
+  // while it reports more remaining.
+  async function retryFailed(button, reason) {
+    button.disabled = true;
+    try {
+      let total = 0;
+      for (let round = 0; round < 20; round += 1) {
+        const result = await api('POST', '/v1/jobs/retry-failed', reason ? { reason } : {});
+        total += result.requeued;
+        if (!result.remaining || result.requeued === 0) break;
+      }
+      button.textContent = `Requeued ${total}`;
+      await loadPipeline();
+    } catch (error) {
+      showError(error);
+    } finally {
+      button.disabled = false;
+    }
+  }
+  $('retry-all').addEventListener('click', async () => {
+    await retryFailed($('retry-all'), null);
+    $('retry-all').textContent = 'Retry all failed';
+  });
 
   // ---- Keys ----
   async function loadKeys() {

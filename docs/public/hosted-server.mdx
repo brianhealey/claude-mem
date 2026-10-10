@@ -145,8 +145,9 @@ exactly what that key can reach and nothing more.
 
 | Tab | What it does | Scope needed |
 |-----|--------------|--------------|
-| **Memories** | Browse recent observations, full-text search, filter by session, read one in full, delete one. | `memories:read` (delete needs `memories:write`) |
-| **Pipeline** | Job counts by status, per-lane queue depth, recent failed jobs with their reason, retry. | `memories:read` (retry needs `memories:write`) |
+| **Memories** | Browse recent observations, full-text search, filter by folder, kind or session, read one in full, delete one. | `memories:read` (delete needs `memories:write`) |
+| **Sessions** | List sessions; open one to see its summary and a timeline of captured events, each with the memories generated from it and its raw payload on request. | `memories:read` |
+| **Pipeline** | Job counts by status, the provider and model last used, median capture-to-memory time, token and memory usage, per-lane queue depth, failed jobs grouped by reason, retry one or all. | `memories:read` (retry needs `memories:write`) |
 | **Keys** | List the team's keys, create a read-only or read-and-write key, revoke a key. | `memories:write` |
 
 <Note>
@@ -154,6 +155,9 @@ The key is kept in the browser tab's session storage, or in local storage if you
 tick **Remember on this device**. Serve the dashboard over HTTPS anywhere the
 network is not trusted: the key is sent as a bearer header on every request.
 </Note>
+
+The usage figures on the Pipeline tab come from `usage_events`, which the
+generation worker only writes when it runs with `CLAUDE_MEM_USAGE_METERING=1`.
 
 `POST /v1/keys` still mints a read-only key by default. Pass
 `{ "scopes": ["memories:read", "memories:write"] }` to mint one that can also
@@ -271,7 +275,9 @@ GET    /v1/info
 GET    /dashboard                 # web dashboard (signs in with an API key)
 GET    /v1/whoami                 # team, project scope and scopes of the key
 GET    /v1/projects               # projects the key can read
+GET    /v1/folders?projectId=     # folders and kinds in a project, with counts
 GET    /v1/sessions?projectId=    # a project's sessions, newest first
+GET    /v1/sessions/:id/events    # a session's events and the memories made from each
 POST   /v1/sessions/start
 POST   /v1/sessions/:id/end
 GET    /v1/sessions/:id
@@ -279,19 +285,20 @@ POST   /v1/events                 # ?generate= ?wait=
 POST   /v1/events/batch
 GET    /v1/events/:id
 POST   /v1/memories
-GET    /v1/memories?projectId=    # page through observations (limit, offset, serverSessionId)
+GET    /v1/memories?projectId=    # page through observations (limit, offset, serverSessionId, folder, kind)
 DELETE /v1/memories/:id           # forget one observation
 POST   /v1/search
 POST   /v1/context
 ALL    /v1/mcp                    # remote authenticated MCP recall
 GET    /v1/jobs                   # generation jobs (status, limit, offset)
-GET    /v1/jobs/summary           # job counts by status
+GET    /v1/jobs/summary           # job counts, failures by reason, last provider, latency
 POST   /v1/jobs/:id/retry
+POST   /v1/jobs/retry-failed      # requeue all failed jobs, optionally for one reason
 POST   /v1/keys                   # mint a key (write scope); read-only by default
 GET    /v1/keys                   # list the team's keys, metadata only (write scope)
 DELETE /v1/keys/:id               # revoke a key (write scope)
 GET    /v1/connect                # connect command with key placeholder
-GET    /v1/usage                  # current-month usage totals
+GET    /v1/usage                  # usage totals for this month and today
 DELETE /v1/projects/:projectId/memory   # purge a whole project
 ```
 

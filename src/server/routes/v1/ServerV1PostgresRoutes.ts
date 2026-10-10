@@ -50,6 +50,11 @@ const MEMORY_LIST_DEFAULT_LIMIT = 50;
 const MEMORY_LIST_MAX_LIMIT = 200;
 const SESSION_LIST_DEFAULT_LIMIT = 50;
 const SESSION_LIST_MAX_LIMIT = 200;
+const SESSION_EVENT_LIST_DEFAULT_LIMIT = 200;
+const SESSION_EVENT_LIST_MAX_LIMIT = 500;
+// How many recent completed jobs the capture-to-memory median is taken over.
+const JOB_LATENCY_SAMPLE_SIZE = 50;
+const BULK_RETRY_MAX_JOBS = 200;
 
 declare const __DEFAULT_PACKAGE_VERSION__: string;
 const MCP_SERVER_VERSION =
@@ -198,8 +203,14 @@ export class ServerV1PostgresRoutes implements RouteHandler {
       const teamId = this.requireTeamId(req, res);
       if (!teamId) return;
       const monthStart = new Date(Date.UTC(new Date().getUTCFullYear(), new Date().getUTCMonth(), 1));
-      const usage = await new PostgresUsageRepository(this.options.pool).summarize({ teamId, since: monthStart });
-      res.status(200).json({ since: monthStart.toISOString(), usage });
+      const usageRepo = new PostgresUsageRepository(this.options.pool);
+      const now = new Date();
+      const dayStart = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate()));
+      const [usage, today] = await Promise.all([
+        usageRepo.summarize({ teamId, since: monthStart }),
+        usageRepo.summarize({ teamId, since: dayStart }),
+      ]);
+      res.status(200).json({ since: monthStart.toISOString(), usage, todaySince: dayStart.toISOString(), today });
     }));
 
     // POST /v1/keys — mint an optionally-expiring API key for the caller's team
@@ -370,7 +381,8 @@ export class ServerV1PostgresRoutes implements RouteHandler {
             server_sessions.platform_source, server_sessions.generation_status,
             server_sessions.metadata->>'project' AS folder,
             server_sessions.started_at, server_sessions.ended_at,
-            (SELECT count(*) FROM observations WHERE observations.server_session_id = server_sessions.id) AS observation_count
+            (SELECT count(*) FROM observations WHERE observations.server_session_id = server_sessions.id) AS observation_count,
+            (SELECT count(*) FROM agent_events WHERE agent_events.server_session_id = server_sessions.id) AS event_count
           FROM server_sessions
           WHERE server_sessions.project_id = $1 AND server_sessions.team_id = $2
           ORDER BY server_sessions.started_at DESC
@@ -379,6 +391,51 @@ export class ServerV1PostgresRoutes implements RouteHandler {
         [projectId, teamId, limit],
       );
       res.status(200).json({ sessions: result.rows.map(serializeSessionListEntry) });
+    }));
+
+    // GET /v1/folders?projectId= — the folders (observations.metadata.project,
+    // the working directory a session ran in) a project's observations came
+    // from, and the observation kinds in use, each with a count. One server
+    // project usually holds several folders, so this is how a reader narrows it.
+    app.get('/v1/folders', readAuth, this.asyncHandler(async (req, res) => {
+      const teamId = this.requireTeamId(req, res);
+      if (!teamId) return;
+      const projectId = typeof req.query.projectId === 'string' ? req.query.projectId : '';
+      if (!projectId) {
+        res.status(400).json({ error: 'ValidationError', message: 'projectId required' });
+        return;
+      }
+      if (!this.ensureProjectAllowed(req, res, projectId)) return;
+      const [folders, kinds] = await Promise.all([
+        this.options.pool.query<{ folder: string | null; count: string; last_at: Date }>(
+          `
+            SELECT metadata->>'project' AS folder, count(*) AS count, max(created_at) AS last_at
+            FROM observations
+            WHERE project_id = $1 AND team_id = $2
+            GROUP BY 1
+            ORDER BY max(created_at) DESC
+          `,
+          [projectId, teamId],
+        ),
+        this.options.pool.query<{ kind: string; count: string }>(
+          `
+            SELECT kind, count(*) AS count
+            FROM observations
+            WHERE project_id = $1 AND team_id = $2
+            GROUP BY 1
+            ORDER BY count(*) DESC
+          `,
+          [projectId, teamId],
+        ),
+      ]);
+      res.status(200).json({
+        folders: folders.rows.map(row => ({
+          folder: row.folder,
+          observationCount: Number(row.count),
+          lastObservationAtEpoch: new Date(row.last_at).getTime(),
+        })),
+        kinds: kinds.rows.map(row => ({ kind: row.kind, observationCount: Number(row.count) })),
+      });
     }));
 
     // GET /v1/memories?projectId= — page through a project's observations,
@@ -398,14 +455,16 @@ export class ServerV1PostgresRoutes implements RouteHandler {
       const serverSessionId = typeof req.query.serverSessionId === 'string' && req.query.serverSessionId
         ? req.query.serverSessionId
         : null;
+      const folder = typeof req.query.folder === 'string' && req.query.folder ? req.query.folder : null;
+      const kind = typeof req.query.kind === 'string' && req.query.kind ? req.query.kind : null;
       // One row past the page tells the caller whether another page exists
       // without a second count query.
       const rows = await new PostgresObservationRepository(this.options.pool).listByProject({
-        projectId, teamId, serverSessionId, limit: limit + 1, offset,
+        projectId, teamId, serverSessionId, folder, kind, limit: limit + 1, offset,
       });
       const page = rows.slice(0, limit);
       await this.auditWrite(req, 'observation.read', null, projectId, {
-        mode: 'list', limit, offset, serverSessionId,
+        mode: 'list', limit, offset, serverSessionId, folder, kind,
         resultCount: page.length, observationIds: page.map(o => o.id),
       });
       res.status(200).json({
@@ -863,8 +922,102 @@ export class ServerV1PostgresRoutes implements RouteHandler {
         if (row.last_completed_at) lastCompleted = Math.max(lastCompleted ?? 0, new Date(row.last_completed_at).getTime());
         if (row.last_failed_at) lastFailed = Math.max(lastFailed ?? 0, new Date(row.last_failed_at).getTime());
       }
-      res.status(200).json({ counts, lastCompletedAtEpoch: lastCompleted, lastFailedAtEpoch: lastFailed });
+      // Why jobs are failing, what last generated successfully, and how long
+      // capture-to-memory takes: the three things an operator checks when the
+      // counts above look wrong.
+      const [reasons, lastRun, latency] = await Promise.all([
+        this.options.pool.query<{ reason: string | null; count: string }>(
+          `
+            SELECT last_error->>'reason' AS reason, count(*) AS count
+            FROM observation_generation_jobs
+            WHERE team_id = $1 AND ($2::text IS NULL OR project_id = $2) AND status = 'failed'
+            GROUP BY 1
+            ORDER BY count(*) DESC
+            LIMIT 20
+          `,
+          [teamId, projectScope],
+        ),
+        this.options.pool.query<{ provider: string | null; model: string | null }>(
+          `
+            SELECT events.details->>'provider' AS provider, events.details->>'model' AS model
+            FROM observation_generation_job_events events
+            INNER JOIN observation_generation_jobs jobs ON jobs.id = events.generation_job_id
+            WHERE jobs.team_id = $1 AND ($2::text IS NULL OR jobs.project_id = $2)
+              AND events.event_type = 'completed'
+            ORDER BY events.created_at DESC
+            LIMIT 1
+          `,
+          [teamId, projectScope],
+        ),
+        this.options.pool.query<{ median_ms: string | null; sample: string }>(
+          `
+            SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY duration_ms) AS median_ms, count(*) AS sample
+            FROM (
+              SELECT extract(epoch FROM completed_at - created_at) * 1000 AS duration_ms
+              FROM observation_generation_jobs
+              WHERE team_id = $1 AND ($2::text IS NULL OR project_id = $2)
+                AND status = 'completed' AND completed_at IS NOT NULL
+              ORDER BY completed_at DESC
+              LIMIT $3
+            ) recent
+          `,
+          [teamId, projectScope, JOB_LATENCY_SAMPLE_SIZE],
+        ),
+      ]);
+      res.status(200).json({
+        counts,
+        lastCompletedAtEpoch: lastCompleted,
+        lastFailedAtEpoch: lastFailed,
+        failedByReason: reasons.rows.map(row => ({ reason: row.reason, count: Number(row.count) })),
+        lastGeneration: lastRun.rows[0]
+          ? { provider: lastRun.rows[0].provider, model: lastRun.rows[0].model }
+          : null,
+        // Queued-to-completed, so it includes time spent waiting in the queue.
+        captureToMemory: {
+          medianMs: latency.rows[0]?.median_ms != null ? Math.round(Number(latency.rows[0].median_ms)) : null,
+          sampleSize: Number(latency.rows[0]?.sample ?? 0),
+        },
+      });
     }));
+
+    // POST /v1/jobs/retry-failed — requeue every failed job in the key's scope,
+    // optionally only those that failed for one `reason`. For the morning after
+    // a provider outage or an exhausted quota, when the failures number in the
+    // dozens and share a cause. Capped per call; `remaining` says whether to
+    // call again.
+    app.post('/v1/jobs/retry-failed', writeAuth, this.handleCreate(
+      z.object({ reason: z.string().min(1).max(500).optional() }),
+      async (req, res, body) => {
+        const teamId = this.requireTeamId(req, res);
+        if (!teamId) return;
+        const projectScope = req.authContext?.projectId ?? null;
+        const failed = await this.options.pool.query<{ id: string; project_id: string }>(
+          `
+            SELECT id, project_id
+            FROM observation_generation_jobs
+            WHERE team_id = $1 AND ($2::text IS NULL OR project_id = $2) AND status = 'failed'
+              AND ($3::text IS NULL OR last_error->>'reason' = $3)
+            ORDER BY failed_at ASC NULLS LAST, created_at ASC
+            LIMIT $4
+          `,
+          [teamId, projectScope, body.reason ?? null, BULK_RETRY_MAX_JOBS + 1],
+        );
+        const batch = failed.rows.slice(0, BULK_RETRY_MAX_JOBS);
+        const repo = new PostgresObservationGenerationJobRepository(this.options.pool);
+        let requeued = 0;
+        for (const row of batch) {
+          const current = await repo.getByIdForScope({ id: row.id, projectId: row.project_id, teamId });
+          // Another request may have retried or cancelled it since the SELECT.
+          if (!current || current.status !== 'failed') continue;
+          if (await this.requeueGenerationJob(req, current, teamId)) requeued += 1;
+        }
+        res.status(200).json({
+          requeued,
+          remaining: failed.rows.length > BULK_RETRY_MAX_JOBS,
+          requestId: req.requestId ?? null,
+        });
+      },
+    ));
 
     // GET /v1/jobs/:id — generation job status, scoped to team/project
     app.get('/v1/jobs/:id', readAuth, this.asyncHandler(async (req, res) => {
@@ -1015,6 +1168,58 @@ export class ServerV1PostgresRoutes implements RouteHandler {
       });
       if (!session) return;
       res.json({ session: serializeSession(session) });
+    }));
+
+    // GET /v1/sessions/:id/events — the session's captured events, oldest
+    // first, each with the ids of the observations generated from it. Payloads
+    // are left out: they hold whole tool inputs and outputs, and
+    // GET /v1/events/:id returns one when a reader asks for it.
+    app.get('/v1/sessions/:id/events', readAuth, this.asyncHandler(async (req, res) => {
+      const teamId = this.requireTeamId(req, res);
+      if (!teamId) return;
+      const id = this.routeParam(req.params.id);
+      const repo = new PostgresServerSessionsRepository(this.options.pool);
+      const session = await this.loadScopedById(req, res, {
+        id,
+        teamId,
+        table: 'server_sessions',
+        notFound: 'Session not found',
+        load: (projectId) => repo.getByIdForScope({ id, projectId, teamId }),
+      });
+      if (!session) return;
+      const limit = clampListLimit(req.query.limit, SESSION_EVENT_LIST_DEFAULT_LIMIT, SESSION_EVENT_LIST_MAX_LIMIT);
+      const offset = clampListOffset(req.query.offset);
+      const result = await this.options.pool.query<{
+        id: string; event_type: string; tool_name: string | null; occurred_at: Date; observation_ids: string[] | null;
+      }>(
+        `
+          SELECT agent_events.id, agent_events.event_type,
+            agent_events.payload->>'tool_name' AS tool_name, agent_events.occurred_at,
+            (SELECT array_agg(observation_sources.observation_id)
+               FROM observation_sources
+              WHERE observation_sources.agent_event_id = agent_events.id) AS observation_ids
+          FROM agent_events
+          WHERE agent_events.server_session_id = $1
+            AND agent_events.project_id = $2
+            AND agent_events.team_id = $3
+          ORDER BY agent_events.occurred_at ASC, agent_events.id ASC
+          LIMIT $4 OFFSET $5
+        `,
+        [session.id, session.projectId, teamId, limit + 1, offset],
+      );
+      const page = result.rows.slice(0, limit);
+      res.status(200).json({
+        events: page.map(row => ({
+          id: row.id,
+          eventType: row.event_type,
+          toolName: row.tool_name,
+          occurredAtEpoch: new Date(row.occurred_at).getTime(),
+          observationIds: row.observation_ids ?? [],
+        })),
+        limit,
+        offset,
+        hasMore: result.rows.length > limit,
+      });
     }));
 
     // POST /v1/sessions/:id/end — set ended_at (idempotent), enqueue a
@@ -1770,6 +1975,23 @@ export class ServerV1PostgresRoutes implements RouteHandler {
       return null;
     }
 
+    const requeued = await this.requeueGenerationJob(req, current, teamId);
+    if (!requeued) {
+      res.status(404).json({ error: 'NotFound', message: 'Generation job not found' });
+      return null;
+    }
+    return { ...requeued, alreadyQueued: false };
+  }
+
+  // The requeue itself, shared by the single retry above and the bulk
+  // POST /v1/jobs/retry-failed: `current` is a failed or cancelled job the
+  // caller has already scope-checked. Returns null if the row vanished.
+  private async requeueGenerationJob(
+    req: Request,
+    current: PostgresObservationGenerationJob,
+    teamId: string,
+  ): Promise<{ job: PostgresObservationGenerationJob; retriedCount: number } | null> {
+    const id = current.id;
     // Reset to queued, clear lock + lifecycle timestamps, increment
     // retried_count for audit. attempts is intentionally preserved so the
     // BullMQ attempt cap is not bypassed; if the job hit max_attempts the
@@ -1818,10 +2040,7 @@ export class ServerV1PostgresRoutes implements RouteHandler {
       [id, current.projectId, teamId, JSON.stringify(newPayload)],
     );
     const updatedRow = updated.rows[0];
-    if (!updatedRow) {
-      res.status(404).json({ error: 'NotFound', message: 'Generation job not found' });
-      return null;
-    }
+    if (!updatedRow) return null;
 
     // Append lifecycle event so the audit chain mirrors the lifecycle tracker.
     const eventsRepo = new PostgresObservationGenerationJobEventsRepository(this.options.pool);
@@ -1860,11 +2079,8 @@ export class ServerV1PostgresRoutes implements RouteHandler {
       }
     }
 
-    const refreshed = await repo.getByIdForScope({ id, projectId: current.projectId, teamId });
-    if (!refreshed) {
-      res.status(404).json({ error: 'NotFound', message: 'Generation job not found' });
-      return null;
-    }
+    const refreshed = await new PostgresObservationGenerationJobRepository(this.options.pool).getByIdForScope({ id, projectId: current.projectId, teamId });
+    if (!refreshed) return null;
 
     await this.auditWrite(req, 'generation_job.retried_by_operator', refreshed.id, refreshed.projectId, {
       previousStatus: current.status,
@@ -1873,7 +2089,7 @@ export class ServerV1PostgresRoutes implements RouteHandler {
       requestId: req.requestId ?? null,
     });
 
-    return { job: refreshed, retriedCount, alreadyQueued: false };
+    return { job: refreshed, retriedCount };
   }
 
   // Phase 12 — operator cancel. Idempotent: a job already in `cancelled`
@@ -2047,6 +2263,7 @@ interface SessionListRow {
   started_at: Date;
   ended_at: Date | null;
   observation_count: string;
+  event_count: string;
 }
 
 function serializeSessionListEntry(row: SessionListRow): Record<string, unknown> {
@@ -2059,6 +2276,7 @@ function serializeSessionListEntry(row: SessionListRow): Record<string, unknown>
     startedAtEpoch: new Date(row.started_at).getTime(),
     endedAtEpoch: row.ended_at ? new Date(row.ended_at).getTime() : null,
     observationCount: Number(row.observation_count),
+    eventCount: Number(row.event_count),
   };
 }
 

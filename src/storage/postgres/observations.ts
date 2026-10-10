@@ -137,20 +137,28 @@ export class PostgresObservationRepository {
     projectId: string;
     teamId: string;
     serverSessionId?: string | null;
+    folder?: string | null;
+    kind?: string | null;
     limit?: number;
     offset?: number;
   }): Promise<PostgresObservation[]> {
     // `id` breaks ties so paging stays stable when rows share a timestamp.
+    // `folder` compares like search()'s folderProjects: ASCII case-insensitive.
     const result = await this.client.query<ObservationRow>(
       `
         SELECT * FROM observations
         WHERE project_id = $1
           AND team_id = $2
           AND ($3::text IS NULL OR server_session_id = $3)
+          AND ($6::text IS NULL OR lower((metadata->>'project') COLLATE "C") = lower($6 COLLATE "C"))
+          AND ($7::text IS NULL OR kind = $7)
         ORDER BY created_at DESC, id DESC
         LIMIT $4 OFFSET $5
       `,
-      [input.projectId, input.teamId, input.serverSessionId ?? null, input.limit ?? 100, input.offset ?? 0]
+      [
+        input.projectId, input.teamId, input.serverSessionId ?? null,
+        input.limit ?? 100, input.offset ?? 0, input.folder ?? null, input.kind ?? null,
+      ]
     );
     return result.rows.map(mapObservationRow);
   }
