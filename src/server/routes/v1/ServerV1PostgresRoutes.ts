@@ -42,6 +42,15 @@ import {
 
 const SOURCE_ADAPTER_DEFAULT = 'api';
 
+// The scopes POST /v1/keys may grant. Minting requires memories:write, so
+// neither is more than the caller already has.
+const MINTABLE_KEY_SCOPES = ['memories:read', 'memories:write'] as const;
+
+const MEMORY_LIST_DEFAULT_LIMIT = 50;
+const MEMORY_LIST_MAX_LIMIT = 200;
+const SESSION_LIST_DEFAULT_LIMIT = 50;
+const SESSION_LIST_MAX_LIMIT = 200;
+
 declare const __DEFAULT_PACKAGE_VERSION__: string;
 const MCP_SERVER_VERSION =
   typeof __DEFAULT_PACKAGE_VERSION__ !== 'undefined' ? __DEFAULT_PACKAGE_VERSION__ : '0.0.0-dev';
@@ -193,19 +202,22 @@ export class ServerV1PostgresRoutes implements RouteHandler {
       res.status(200).json({ since: monthStart.toISOString(), usage });
     }));
 
-    // POST /v1/keys — mint a READ-ONLY, optionally-expiring API key for the
-    // caller's team and return the ready-to-paste connect command. Gated by
-    // writeAuth: minting a lesser (read) key requires you can already write the
-    // team's memory, which avoids a read key escalating into more keys. The raw
-    // key is shown exactly once.
+    // POST /v1/keys — mint an optionally-expiring API key for the caller's team
+    // and return the ready-to-paste connect command. READ-ONLY unless `scopes`
+    // asks for write as well. Gated by writeAuth: the caller can already write
+    // the team's memory, so a read or write key is never more than it holds,
+    // and a read key cannot escalate itself into more keys. The raw key is
+    // shown exactly once.
     app.post('/v1/keys', writeAuth, this.handleCreate(
       z.object({
         label: z.string().max(120).optional(),
         expiresInDays: z.number().int().positive().max(365).optional(),
+        scopes: z.array(z.enum(MINTABLE_KEY_SCOPES)).min(1).optional(),
       }),
       async (req, res, body) => {
         const teamId = this.requireTeamId(req, res);
         if (!teamId) return;
+        const scopes = [...new Set(body.scopes ?? ['memories:read'])];
         const raw = `cm_${randomBytes(24).toString('hex')}`;
         const keyHash = createHash('sha256').update(raw).digest('hex');
         const expiresAt = body.expiresInDays
@@ -216,15 +228,16 @@ export class ServerV1PostgresRoutes implements RouteHandler {
           teamId,
           projectId: req.authContext?.projectId ?? null,
           actorId: req.authContext?.apiKeyId ?? 'api',
-          scopes: ['memories:read'],
+          scopes,
           expiresAt,
         });
         void body.label; // reserved for when api_keys grows a label column
+        await this.auditWrite(req, 'api_key.created', key.id, req.authContext?.projectId ?? null, { scopes });
         const mcpUrl = mcpConnectUrl(req);
         res.status(201).json({
           id: key.id,
           apiKey: raw, // shown ONCE — store it now
-          scopes: ['memories:read'],
+          scopes,
           expiresAt: expiresAt?.toISOString() ?? null,
           mcpUrl,
           connectCommand: mcpConnectCommand(mcpUrl, raw),
@@ -242,6 +255,164 @@ export class ServerV1PostgresRoutes implements RouteHandler {
         mcpUrl,
         connectCommand: mcpConnectCommand(mcpUrl, '<YOUR_API_KEY>'),
         hint: 'POST /v1/keys (write scope) to mint a read-only key for this link.',
+      });
+    }));
+
+    // GET /v1/whoami — what the presented key is: its team, its project scope
+    // (null for a team-wide key) and its scopes. A UI holding only a pasted
+    // key needs this before it can address any project-scoped route.
+    app.get('/v1/whoami', readAuth, this.asyncHandler(async (req, res) => {
+      const teamId = this.requireTeamId(req, res);
+      if (!teamId) return;
+      res.status(200).json({
+        apiKeyId: req.authContext?.apiKeyId ?? null,
+        teamId,
+        projectId: req.authContext?.projectId ?? null,
+        scopes: req.authContext?.scopes ?? [],
+      });
+    }));
+
+    // GET /v1/keys — the team's API keys, metadata only. key_hash is never
+    // selected, so no response can carry key material. A project-scoped caller
+    // sees only that project's keys. writeAuth, like minting: a pasted
+    // read-only recall link must not be able to enumerate the team's keys.
+    app.get('/v1/keys', writeAuth, this.asyncHandler(async (req, res) => {
+      const teamId = this.requireTeamId(req, res);
+      if (!teamId) return;
+      const projectScope = req.authContext?.projectId ?? null;
+      const result = await this.options.pool.query<ApiKeyListRow>(
+        `
+          SELECT id, project_id, actor_id, scopes, revoked_at, expires_at, created_at
+          FROM api_keys
+          WHERE team_id = $1 AND ($2::text IS NULL OR project_id = $2)
+          ORDER BY created_at DESC
+          LIMIT 500
+        `,
+        [teamId, projectScope],
+      );
+      res.status(200).json({
+        keys: result.rows.map(row => serializeApiKeyListEntry(row, req.authContext?.apiKeyId ?? null)),
+      });
+    }));
+
+    // DELETE /v1/keys/:id — revoke a key. Idempotent on an already-revoked key.
+    // A key cannot revoke itself: that would lock the caller out mid-request
+    // with no key left to undo it.
+    app.delete('/v1/keys/:id', writeAuth, this.asyncHandler(async (req, res) => {
+      const teamId = this.requireTeamId(req, res);
+      if (!teamId) return;
+      const id = this.routeParam(req.params.id);
+      if (id === req.authContext?.apiKeyId) {
+        res.status(409).json({ error: 'Conflict', message: 'A key cannot revoke itself; use a different key' });
+        return;
+      }
+      const projectScope = req.authContext?.projectId ?? null;
+      const result = await this.options.pool.query<{ id: string }>(
+        `
+          UPDATE api_keys SET revoked_at = COALESCE(revoked_at, now()), updated_at = now()
+          WHERE id = $1 AND team_id = $2 AND ($3::text IS NULL OR project_id = $3)
+          RETURNING id
+        `,
+        [id, teamId, projectScope],
+      );
+      if (result.rows.length === 0) {
+        res.status(404).json({ error: 'NotFound', message: 'API key not found' });
+        return;
+      }
+      await this.auditWrite(req, 'api_key.revoked', id, projectScope, { via: 'api' });
+      res.status(200).json({ revoked: true, id });
+    }));
+
+    // GET /v1/projects — the projects this key can read: every project of the
+    // team, or just the one a project-scoped key is bound to.
+    app.get('/v1/projects', readAuth, this.asyncHandler(async (req, res) => {
+      const teamId = this.requireTeamId(req, res);
+      if (!teamId) return;
+      const projectScope = req.authContext?.projectId ?? null;
+      const result = await this.options.pool.query<{
+        id: string; name: string; created_at: Date; observation_count: string;
+      }>(
+        `
+          SELECT projects.id, projects.name, projects.created_at,
+            (SELECT count(*) FROM observations WHERE observations.project_id = projects.id) AS observation_count
+          FROM projects
+          WHERE projects.team_id = $1 AND ($2::text IS NULL OR projects.id = $2)
+          ORDER BY projects.created_at ASC
+        `,
+        [teamId, projectScope],
+      );
+      res.status(200).json({
+        projects: result.rows.map(row => ({
+          id: row.id,
+          name: row.name,
+          createdAtEpoch: new Date(row.created_at).getTime(),
+          observationCount: Number(row.observation_count),
+        })),
+      });
+    }));
+
+    // GET /v1/sessions?projectId= — a project's sessions, newest first, each
+    // with how many observations it produced.
+    app.get('/v1/sessions', readAuth, this.asyncHandler(async (req, res) => {
+      const teamId = this.requireTeamId(req, res);
+      if (!teamId) return;
+      const projectId = typeof req.query.projectId === 'string' ? req.query.projectId : '';
+      if (!projectId) {
+        res.status(400).json({ error: 'ValidationError', message: 'projectId required' });
+        return;
+      }
+      if (!this.ensureProjectAllowed(req, res, projectId)) return;
+      const limit = clampListLimit(req.query.limit, SESSION_LIST_DEFAULT_LIMIT, SESSION_LIST_MAX_LIMIT);
+      const result = await this.options.pool.query<SessionListRow>(
+        `
+          SELECT server_sessions.id,
+            COALESCE(NULLIF(server_sessions.content_session_id, ''), server_sessions.external_session_id) AS content_session_id,
+            server_sessions.platform_source, server_sessions.generation_status,
+            server_sessions.metadata->>'project' AS folder,
+            server_sessions.started_at, server_sessions.ended_at,
+            (SELECT count(*) FROM observations WHERE observations.server_session_id = server_sessions.id) AS observation_count
+          FROM server_sessions
+          WHERE server_sessions.project_id = $1 AND server_sessions.team_id = $2
+          ORDER BY server_sessions.started_at DESC
+          LIMIT $3
+        `,
+        [projectId, teamId, limit],
+      );
+      res.status(200).json({ sessions: result.rows.map(serializeSessionListEntry) });
+    }));
+
+    // GET /v1/memories?projectId= — page through a project's observations,
+    // newest first, optionally one session's. The browse path: /v1/search and
+    // /v1/context answer a question, this lists what is stored.
+    app.get('/v1/memories', readAuth, this.asyncHandler(async (req, res) => {
+      const teamId = this.requireTeamId(req, res);
+      if (!teamId) return;
+      const projectId = typeof req.query.projectId === 'string' ? req.query.projectId : '';
+      if (!projectId) {
+        res.status(400).json({ error: 'ValidationError', message: 'projectId required' });
+        return;
+      }
+      if (!this.ensureProjectAllowed(req, res, projectId)) return;
+      const limit = clampListLimit(req.query.limit, MEMORY_LIST_DEFAULT_LIMIT, MEMORY_LIST_MAX_LIMIT);
+      const offset = clampListOffset(req.query.offset);
+      const serverSessionId = typeof req.query.serverSessionId === 'string' && req.query.serverSessionId
+        ? req.query.serverSessionId
+        : null;
+      // One row past the page tells the caller whether another page exists
+      // without a second count query.
+      const rows = await new PostgresObservationRepository(this.options.pool).listByProject({
+        projectId, teamId, serverSessionId, limit: limit + 1, offset,
+      });
+      const page = rows.slice(0, limit);
+      await this.auditWrite(req, 'observation.read', null, projectId, {
+        mode: 'list', limit, offset, serverSessionId,
+        resultCount: page.length, observationIds: page.map(o => o.id),
+      });
+      res.status(200).json({
+        observations: page.map(serializeObservation),
+        limit,
+        offset,
+        hasMore: rows.length > limit,
       });
     }));
 
@@ -663,6 +834,36 @@ export class ServerV1PostgresRoutes implements RouteHandler {
         offset,
         requestId: req.requestId ?? null,
       });
+    }));
+
+    // GET /v1/jobs/summary — job counts by status for the key's scope, plus
+    // when a job last completed and last failed. Registered ahead of
+    // /v1/jobs/:id, which would otherwise read "summary" as a job id.
+    app.get('/v1/jobs/summary', readAuth, this.asyncHandler(async (req, res) => {
+      const teamId = this.requireTeamId(req, res);
+      if (!teamId) return;
+      const projectScope = req.authContext?.projectId ?? null;
+      const result = await this.options.pool.query<{
+        status: string; count: string; last_completed_at: Date | null; last_failed_at: Date | null;
+      }>(
+        `
+          SELECT status, count(*) AS count,
+            max(completed_at) AS last_completed_at, max(failed_at) AS last_failed_at
+          FROM observation_generation_jobs
+          WHERE team_id = $1 AND ($2::text IS NULL OR project_id = $2)
+          GROUP BY status
+        `,
+        [teamId, projectScope],
+      );
+      const counts: Record<string, number> = { queued: 0, processing: 0, completed: 0, failed: 0, cancelled: 0 };
+      let lastCompleted: number | null = null;
+      let lastFailed: number | null = null;
+      for (const row of result.rows) {
+        counts[row.status] = Number(row.count);
+        if (row.last_completed_at) lastCompleted = Math.max(lastCompleted ?? 0, new Date(row.last_completed_at).getTime());
+        if (row.last_failed_at) lastFailed = Math.max(lastFailed ?? 0, new Date(row.last_failed_at).getTime());
+      }
+      res.status(200).json({ counts, lastCompletedAtEpoch: lastCompleted, lastFailedAtEpoch: lastFailed });
     }));
 
     // GET /v1/jobs/:id — generation job status, scoped to team/project
@@ -1810,6 +2011,66 @@ export class ServerV1PostgresRoutes implements RouteHandler {
       Promise.resolve(fn(req, res)).catch(next);
     };
   }
+}
+
+interface ApiKeyListRow {
+  id: string;
+  project_id: string | null;
+  actor_id: string;
+  scopes: unknown;
+  revoked_at: Date | null;
+  expires_at: Date | null;
+  created_at: Date;
+}
+
+function serializeApiKeyListEntry(row: ApiKeyListRow, callerKeyId: string | null): Record<string, unknown> {
+  const expired = row.expires_at !== null && new Date(row.expires_at).getTime() <= Date.now();
+  return {
+    id: row.id,
+    projectId: row.project_id,
+    actorId: row.actor_id,
+    scopes: Array.isArray(row.scopes) ? row.scopes : [],
+    status: row.revoked_at ? 'revoked' : expired ? 'expired' : 'active',
+    createdAtEpoch: new Date(row.created_at).getTime(),
+    expiresAtEpoch: row.expires_at ? new Date(row.expires_at).getTime() : null,
+    revokedAtEpoch: row.revoked_at ? new Date(row.revoked_at).getTime() : null,
+    current: row.id === callerKeyId,
+  };
+}
+
+interface SessionListRow {
+  id: string;
+  content_session_id: string | null;
+  platform_source: string | null;
+  generation_status: string;
+  folder: string | null;
+  started_at: Date;
+  ended_at: Date | null;
+  observation_count: string;
+}
+
+function serializeSessionListEntry(row: SessionListRow): Record<string, unknown> {
+  return {
+    id: row.id,
+    contentSessionId: row.content_session_id,
+    platformSource: row.platform_source,
+    generationStatus: row.generation_status,
+    folder: row.folder,
+    startedAtEpoch: new Date(row.started_at).getTime(),
+    endedAtEpoch: row.ended_at ? new Date(row.ended_at).getTime() : null,
+    observationCount: Number(row.observation_count),
+  };
+}
+
+function clampListLimit(raw: unknown, fallback: number, max: number): number {
+  const parsed = typeof raw === 'string' ? Number.parseInt(raw, 10) : Number.NaN;
+  if (!Number.isFinite(parsed) || parsed <= 0) return fallback;
+  return Math.min(parsed, max);
+}
+
+function clampListOffset(raw: unknown): number {
+  const parsed = typeof raw === 'string' ? Number.parseInt(raw, 10) : Number.NaN;
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : 0;
 }
 
 interface JobListRow {

@@ -1,0 +1,688 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light dark">
+<title>claude-mem · Server dashboard</title>
+<!--
+  Hosted-server dashboard. A standalone page with no bundle and no external
+  resources: it talks to this server's own /v1 API with an API key the operator
+  pastes in. Every value from the API reaches the DOM through textContent, never
+  innerHTML, because observation text is model-written and may contain markup.
+-->
+<style>
+  :root {
+    --bg: #f7f5f1;
+    --panel: #ffffff;
+    --fg: #1b1a18;
+    --dim: #6f6b63;
+    --line: #e3dfd7;
+    --accent: #b4532f;
+    --accent-fg: #ffffff;
+    --ok: #2f7d4f;
+    --warn: #a86a00;
+    --bad: #b3261e;
+    --chip: #efebe4;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #0d0d0c;
+      --panel: #171614;
+      --fg: #f4f2ee;
+      --dim: #9d978c;
+      --line: #2b2925;
+      --accent: #d9774f;
+      --accent-fg: #14110f;
+      --ok: #6cc08b;
+      --warn: #e0a84a;
+      --bad: #ef8a80;
+      --chip: #24221f;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--fg);
+    font: 400 15px/1.5 ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+  }
+  [hidden] { display: none !important; }
+  button, input, select { font: inherit; color: inherit; }
+  button {
+    border: 1px solid var(--line);
+    background: var(--panel);
+    border-radius: 6px;
+    padding: 6px 12px;
+    cursor: pointer;
+  }
+  button:hover { border-color: var(--dim); }
+  button:disabled { opacity: 0.5; cursor: default; }
+  button.primary { background: var(--accent); border-color: var(--accent); color: var(--accent-fg); font-weight: 600; }
+  button.danger { color: var(--bad); }
+  button.quiet { border-color: transparent; background: transparent; color: var(--dim); padding: 4px 8px; }
+  button.quiet:hover { color: var(--fg); }
+  input, select {
+    border: 1px solid var(--line);
+    background: var(--panel);
+    border-radius: 6px;
+    padding: 7px 10px;
+    min-width: 0;
+  }
+  :focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+  code, .mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 0.9em; }
+
+  header {
+    display: flex;
+    align-items: center;
+    gap: 16px;
+    padding: 12px 24px;
+    border-bottom: 1px solid var(--line);
+    background: var(--panel);
+    flex-wrap: wrap;
+  }
+  header h1 { font-size: 16px; margin: 0; font-weight: 650; letter-spacing: -0.01em; }
+  header h1 span { color: var(--dim); font-weight: 400; }
+  header .spacer { flex: 1; }
+  nav { display: flex; gap: 4px; }
+  nav button { border-color: transparent; background: transparent; color: var(--dim); }
+  nav button[aria-selected="true"] { background: var(--chip); color: var(--fg); font-weight: 600; }
+
+  main { max-width: 1040px; margin: 0 auto; padding: 24px; }
+  .toolbar { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 16px; }
+  .toolbar .grow { flex: 1 1 240px; }
+  .note { color: var(--dim); }
+  .error { color: var(--bad); }
+  .banner { border: 1px solid var(--line); border-radius: 8px; background: var(--panel); padding: 12px 16px; margin-bottom: 16px; }
+  .banner.bad { border-color: var(--bad); }
+
+  .chip {
+    display: inline-block;
+    background: var(--chip);
+    border-radius: 999px;
+    padding: 1px 9px;
+    font-size: 12px;
+    color: var(--dim);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    text-align: center;
+  }
+  .chip.ok { color: var(--ok); }
+  .chip.warn { color: var(--warn); }
+  .chip.bad { color: var(--bad); }
+
+  /* sign in */
+  #signin { max-width: 440px; margin: 12vh auto 0; padding: 24px; }
+  #signin h1 { font-size: 22px; margin: 0 0 4px; letter-spacing: -0.02em; }
+  #signin form { display: grid; gap: 12px; margin-top: 20px; }
+  #signin label.check { display: flex; gap: 8px; align-items: center; color: var(--dim); font-size: 14px; }
+
+  /* memories */
+  .memory { border: 1px solid var(--line); border-radius: 8px; background: var(--panel); margin-bottom: 8px; }
+  .memory > button.row {
+    display: grid;
+    grid-template-columns: 88px 1fr auto;
+    gap: 12px;
+    align-items: baseline;
+    width: 100%;
+    text-align: left;
+    border: 0;
+    background: transparent;
+    padding: 12px 16px;
+    border-radius: 8px;
+  }
+  .memory .title { font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .memory .when { color: var(--dim); font-size: 13px; white-space: nowrap; }
+  .memory .body { padding: 0 16px 14px; border-top: 1px solid var(--line); }
+  .memory .body pre {
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+    font: inherit;
+    margin: 12px 0;
+  }
+  .memory .meta { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; color: var(--dim); font-size: 13px; }
+  .memory .meta .spacer { flex: 1; }
+
+  /* pipeline */
+  .tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: 12px; margin-bottom: 24px; }
+  .tile { border: 1px solid var(--line); border-radius: 8px; background: var(--panel); padding: 14px 16px; }
+  .tile .label { color: var(--dim); font-size: 13px; }
+  .tile .value { font-size: 28px; font-weight: 650; letter-spacing: -0.02em; font-variant-numeric: tabular-nums; }
+  .tile.bad .value { color: var(--bad); }
+  h2 { font-size: 15px; margin: 24px 0 8px; }
+  table { width: 100%; border-collapse: collapse; background: var(--panel); border: 1px solid var(--line); border-radius: 8px; overflow: hidden; }
+  th, td { text-align: left; padding: 9px 12px; border-bottom: 1px solid var(--line); vertical-align: top; }
+  th { font-size: 12px; font-weight: 600; color: var(--dim); text-transform: uppercase; letter-spacing: 0.05em; }
+  tr:last-child td { border-bottom: 0; }
+  td.num { font-variant-numeric: tabular-nums; }
+  td.actions { text-align: right; white-space: nowrap; }
+  .tablewrap { overflow-x: auto; }
+
+  /* keys */
+  .minted { border: 1px solid var(--accent); border-radius: 8px; background: var(--panel); padding: 14px 16px; margin-bottom: 16px; }
+  .minted .secret { display: flex; gap: 8px; align-items: center; margin: 8px 0; }
+  .minted .secret code { flex: 1; overflow-wrap: anywhere; background: var(--chip); padding: 8px 10px; border-radius: 6px; }
+</style>
+</head>
+<body>
+
+<section id="signin" hidden>
+  <h1>claude-mem server</h1>
+  <p class="note">Sign in with an API key for this server. The key is sent only to this server.</p>
+  <form id="signin-form">
+    <input id="signin-key" type="password" autocomplete="off" spellcheck="false" placeholder="cmem_… or cm_…" aria-label="API key" required>
+    <label class="check"><input id="signin-remember" type="checkbox"> Remember on this device</label>
+    <button class="primary" type="submit">Sign in</button>
+    <div id="signin-error" class="error" role="alert"></div>
+  </form>
+</section>
+
+<div id="app" hidden>
+  <header>
+    <h1>claude-mem <span>server</span></h1>
+    <nav role="tablist">
+      <button role="tab" data-tab="memories" aria-selected="true">Memories</button>
+      <button role="tab" data-tab="pipeline" aria-selected="false">Pipeline</button>
+      <button role="tab" data-tab="keys" aria-selected="false">Keys</button>
+    </nav>
+    <div class="spacer"></div>
+    <select id="project" aria-label="Project"></select>
+    <span id="access" class="chip"></span>
+    <button id="signout" class="quiet">Sign out</button>
+  </header>
+
+  <main>
+    <div id="global-error" class="banner bad error" role="alert" hidden></div>
+
+    <section id="tab-memories">
+      <form id="search-form" class="toolbar">
+        <input id="search-query" class="grow" type="search" placeholder="Search memories" aria-label="Search memories">
+        <select id="session-filter" aria-label="Session"></select>
+        <button type="submit">Search</button>
+        <button type="button" id="search-clear" class="quiet" hidden>Clear</button>
+      </form>
+      <p id="memories-status" class="note"></p>
+      <div id="memories"></div>
+      <button id="memories-more" hidden>Load more</button>
+    </section>
+
+    <section id="tab-pipeline" hidden>
+      <div id="pipeline-health" class="banner"></div>
+      <div id="pipeline-tiles" class="tiles"></div>
+      <h2>Queue lanes</h2>
+      <div class="tablewrap"><table id="lanes"></table></div>
+      <h2>Failed jobs</h2>
+      <p id="failed-status" class="note"></p>
+      <div class="tablewrap"><table id="failed"></table></div>
+    </section>
+
+    <section id="tab-keys" hidden>
+      <p id="keys-readonly" class="banner" hidden>This key is read-only. Managing keys needs a key with write access.</p>
+      <div id="keys-body">
+        <div id="minted" class="minted" hidden></div>
+        <form id="mint-form" class="toolbar">
+          <select id="mint-scope" aria-label="Access">
+            <option value="read">Read-only (recall)</option>
+            <option value="write">Read and write (capture)</option>
+          </select>
+          <select id="mint-expiry" aria-label="Expiry">
+            <option value="">Never expires</option>
+            <option value="30">Expires in 30 days</option>
+            <option value="90">Expires in 90 days</option>
+            <option value="365">Expires in 1 year</option>
+          </select>
+          <button type="submit" class="primary">Create key</button>
+        </form>
+        <div class="tablewrap"><table id="keys"></table></div>
+      </div>
+    </section>
+  </main>
+</div>
+
+<script>
+(() => {
+  'use strict';
+
+  const STORAGE_KEY = 'claude-mem.dashboard.apiKey';
+  const PAGE_SIZE = 50;
+  const PIPELINE_REFRESH_MS = 10000;
+  const $ = id => document.getElementById(id);
+
+  const state = {
+    apiKey: null,
+    who: null,
+    canWrite: false,
+    projectId: null,
+    tab: 'memories',
+    offset: 0,
+    query: '',
+    pipelineTimer: null,
+  };
+
+  // ---- DOM helpers. Text always goes in through textContent. ----
+  function el(tag, props, ...children) {
+    const node = document.createElement(tag);
+    for (const [key, value] of Object.entries(props || {})) {
+      if (value === null || value === undefined || value === false) continue;
+      if (key === 'class') node.className = value;
+      else if (key === 'text') node.textContent = value;
+      else if (key.startsWith('on')) node.addEventListener(key.slice(2), value);
+      else node.setAttribute(key, value === true ? '' : value);
+    }
+    for (const child of children) {
+      if (child !== null && child !== undefined && child !== false) node.append(child);
+    }
+    return node;
+  }
+  function clear(node) { node.replaceChildren(); return node; }
+
+  function formatWhen(epoch) {
+    if (!epoch) return '—';
+    const date = new Date(epoch);
+    const seconds = Math.round((Date.now() - epoch) / 1000);
+    if (seconds < 60 && seconds >= 0) return 'just now';
+    if (seconds < 3600 && seconds >= 0) return `${Math.floor(seconds / 60)} min ago`;
+    if (seconds < 86400 && seconds >= 0) return `${Math.floor(seconds / 3600)} h ago`;
+    return date.toLocaleString(undefined, { dateStyle: 'medium', timeStyle: 'short' });
+  }
+  const shortId = id => (id ? String(id).slice(0, 8) : '—');
+
+  // ---- API ----
+  class ApiError extends Error {
+    constructor(status, message) { super(message); this.status = status; }
+  }
+  async function api(method, path, body) {
+    const response = await fetch(path, {
+      method,
+      headers: {
+        Authorization: `Bearer ${state.apiKey}`,
+        ...(body !== undefined ? { 'Content-Type': 'application/json' } : {}),
+      },
+      body: body !== undefined ? JSON.stringify(body) : undefined,
+    });
+    let payload = null;
+    try { payload = await response.json(); } catch { /* empty or non-JSON body */ }
+    if (!response.ok) {
+      throw new ApiError(response.status, (payload && (payload.message || payload.error)) || `HTTP ${response.status}`);
+    }
+    return payload;
+  }
+
+  function showError(error) {
+    // The server answers an unknown or revoked key with 403 on every route.
+    if (error instanceof ApiError && (error.status === 401 || error.status === 403) && !state.who) {
+      signOut('That key was not accepted.');
+      return;
+    }
+    const banner = $('global-error');
+    banner.textContent = error.message || String(error);
+    banner.hidden = false;
+  }
+  function clearError() { $('global-error').hidden = true; }
+
+  // An inline two-step confirm, so a destructive click never opens a browser
+  // dialog: the button turns into "Confirm" and reverts if left alone.
+  function confirmButton(label, onConfirm) {
+    let armed = false;
+    let timer = null;
+    const button = el('button', { class: 'quiet danger', type: 'button', text: label });
+    button.addEventListener('click', async () => {
+      if (!armed) {
+        armed = true;
+        button.textContent = `Confirm ${label.toLowerCase()}`;
+        timer = setTimeout(() => { armed = false; button.textContent = label; }, 4000);
+        return;
+      }
+      clearTimeout(timer);
+      button.disabled = true;
+      try { await onConfirm(); } catch (error) { button.disabled = false; armed = false; button.textContent = label; showError(error); }
+    });
+    return button;
+  }
+
+  // ---- Sign in ----
+  function signOut(message) {
+    sessionStorage.removeItem(STORAGE_KEY);
+    localStorage.removeItem(STORAGE_KEY);
+    clearInterval(state.pipelineTimer);
+    Object.assign(state, { apiKey: null, who: null, canWrite: false, projectId: null });
+    $('app').hidden = true;
+    $('signin').hidden = false;
+    $('signin-error').textContent = message || '';
+    $('signin-key').value = '';
+    $('signin-key').focus();
+  }
+
+  async function signIn(apiKey, remember) {
+    state.apiKey = apiKey;
+    let who;
+    try {
+      who = await api('GET', '/v1/whoami');
+    } catch (error) {
+      state.apiKey = null;
+      throw new Error(error instanceof ApiError && error.status === 403 ? 'That key was not accepted.' : error.message);
+    }
+    (remember ? localStorage : sessionStorage).setItem(STORAGE_KEY, apiKey);
+    state.who = who;
+    state.canWrite = who.scopes.includes('memories:write');
+    $('access').textContent = state.canWrite ? 'read + write' : 'read-only';
+    $('signin').hidden = true;
+    $('app').hidden = false;
+    await loadProjects();
+    selectTab('memories');
+  }
+
+  $('signin-form').addEventListener('submit', async event => {
+    event.preventDefault();
+    $('signin-error').textContent = '';
+    try {
+      await signIn($('signin-key').value.trim(), $('signin-remember').checked);
+    } catch (error) {
+      $('signin-error').textContent = error.message;
+    }
+  });
+  $('signout').addEventListener('click', () => signOut());
+
+  // ---- Projects ----
+  async function loadProjects() {
+    const { projects } = await api('GET', '/v1/projects');
+    const select = clear($('project'));
+    for (const project of projects) {
+      select.append(el('option', { value: project.id, text: `${project.name} (${project.observationCount})` }));
+    }
+    state.projectId = state.who.projectId || (projects[0] && projects[0].id) || null;
+    if (state.projectId) select.value = state.projectId;
+    select.hidden = projects.length < 2;
+  }
+  $('project').addEventListener('change', event => {
+    state.projectId = event.target.value;
+    selectTab(state.tab);
+  });
+
+  // ---- Tabs ----
+  function selectTab(tab) {
+    state.tab = tab;
+    clearError();
+    clearInterval(state.pipelineTimer);
+    for (const button of document.querySelectorAll('nav [role=tab]')) {
+      button.setAttribute('aria-selected', String(button.dataset.tab === tab));
+    }
+    for (const name of ['memories', 'pipeline', 'keys']) $(`tab-${name}`).hidden = name !== tab;
+    if (tab === 'memories') { loadSessions().catch(showError); reloadMemories(); }
+    if (tab === 'pipeline') {
+      loadPipeline();
+      state.pipelineTimer = setInterval(() => { if (!document.hidden) loadPipeline(); }, PIPELINE_REFRESH_MS);
+    }
+    if (tab === 'keys') loadKeys();
+  }
+  for (const button of document.querySelectorAll('nav [role=tab]')) {
+    button.addEventListener('click', () => selectTab(button.dataset.tab));
+  }
+
+  // ---- Memories ----
+  async function loadSessions() {
+    const select = $('session-filter');
+    const previous = select.value;
+    const { sessions } = await api('GET', `/v1/sessions?projectId=${encodeURIComponent(state.projectId)}&limit=100`);
+    clear(select).append(el('option', { value: '', text: 'All sessions' }));
+    for (const session of sessions) {
+      const label = [
+        new Date(session.startedAtEpoch).toLocaleString(undefined, { dateStyle: 'short', timeStyle: 'short' }),
+        session.folder,
+        `${session.observationCount} obs`,
+      ].filter(Boolean).join(' · ');
+      select.append(el('option', { value: session.id, text: label }));
+    }
+    if ([...select.options].some(option => option.value === previous)) select.value = previous;
+  }
+
+  function memoryCard(observation) {
+    const [firstLine, ...rest] = String(observation.content || '').split('\n');
+    const bodyText = rest.join('\n').trim();
+    const body = el('div', { class: 'body', hidden: true });
+    const card = el('article', { class: 'memory' });
+    const row = el('button', { class: 'row', type: 'button', 'aria-expanded': 'false' },
+      el('span', { class: 'chip', text: observation.kind || 'memory' }),
+      el('span', { class: 'title', text: firstLine || '(empty)' }),
+      el('span', { class: 'when', text: formatWhen(observation.createdAtEpoch) }),
+    );
+    row.addEventListener('click', () => {
+      body.hidden = !body.hidden;
+      row.setAttribute('aria-expanded', String(!body.hidden));
+    });
+    const meta = el('div', { class: 'meta' },
+      el('span', { text: new Date(observation.createdAtEpoch).toLocaleString() }),
+      observation.metadata && observation.metadata.project ? el('span', { class: 'chip', text: observation.metadata.project }) : null,
+      observation.serverSessionId ? el('span', { class: 'mono', text: `session ${shortId(observation.serverSessionId)}` }) : null,
+      el('span', { class: 'mono', text: `id ${shortId(observation.id)}` }),
+      el('span', { class: 'spacer' }),
+      state.canWrite ? confirmButton('Delete', async () => {
+        await api('DELETE', `/v1/memories/${encodeURIComponent(observation.id)}`);
+        card.remove();
+      }) : null,
+    );
+    body.append(el('pre', { text: bodyText || firstLine }), meta);
+    card.append(row, body);
+    return card;
+  }
+
+  async function reloadMemories() {
+    state.offset = 0;
+    clear($('memories'));
+    await loadMemories();
+  }
+
+  async function loadMemories() {
+    const status = $('memories-status');
+    const more = $('memories-more');
+    clearError();
+    more.hidden = true;
+    if (!state.projectId) { status.textContent = 'This key has no project yet.'; return; }
+    status.textContent = 'Loading…';
+    try {
+      let observations;
+      let hasMore = false;
+      if (state.query) {
+        ({ observations } = await api('POST', '/v1/search', { projectId: state.projectId, query: state.query, limit: 100 }));
+        const sessionId = $('session-filter').value;
+        if (sessionId) observations = observations.filter(o => o.serverSessionId === sessionId);
+      } else {
+        const params = new URLSearchParams({ projectId: state.projectId, limit: String(PAGE_SIZE), offset: String(state.offset) });
+        if ($('session-filter').value) params.set('serverSessionId', $('session-filter').value);
+        ({ observations, hasMore } = await api('GET', `/v1/memories?${params}`));
+      }
+      const list = $('memories');
+      for (const observation of observations) list.append(memoryCard(observation));
+      state.offset += observations.length;
+      more.hidden = !hasMore;
+      const shown = list.childElementCount;
+      status.textContent = shown === 0
+        ? (state.query ? `Nothing matches “${state.query}”.` : 'No memories yet. They appear here as sessions are captured.')
+        : (state.query ? `${shown} result${shown === 1 ? '' : 's'} for “${state.query}”` : `Showing ${shown} most recent`);
+    } catch (error) {
+      status.textContent = '';
+      showError(error);
+    }
+  }
+
+  $('search-form').addEventListener('submit', event => {
+    event.preventDefault();
+    state.query = $('search-query').value.trim();
+    $('search-clear').hidden = !state.query;
+    reloadMemories();
+  });
+  $('search-clear').addEventListener('click', () => {
+    $('search-query').value = '';
+    state.query = '';
+    $('search-clear').hidden = true;
+    reloadMemories();
+  });
+  $('session-filter').addEventListener('change', reloadMemories);
+  $('memories-more').addEventListener('click', loadMemories);
+
+  // ---- Pipeline ----
+  function tile(label, value, bad) {
+    return el('div', { class: bad ? 'tile bad' : 'tile' },
+      el('div', { class: 'label', text: label }),
+      el('div', { class: 'value', text: String(value) }),
+    );
+  }
+  function headerRow(...labels) {
+    return el('tr', {}, ...labels.map(label => el('th', { text: label })));
+  }
+
+  async function loadPipeline() {
+    try {
+      const [info, summary, failed] = await Promise.all([
+        fetch('/v1/info').then(response => response.json()),
+        api('GET', '/v1/jobs/summary'),
+        api('GET', '/v1/jobs?status=failed&limit=25'),
+      ]);
+      clearError();
+
+      const queue = (info.boundaries && info.boundaries.queueManager) || {};
+      const lanes = info.queueLanes || [];
+      const queueOk = queue.status === 'active';
+      const stuck = summary.counts.queued > 0 && lanes.length > 0 && lanes.every(lane => (lane.waiting || 0) === 0 && (lane.active || 0) === 0);
+      const health = clear($('pipeline-health'));
+      health.append(
+        el('span', { class: `chip ${queueOk ? 'ok' : 'bad'}`, text: queueOk ? 'queue connected' : `queue ${queue.status || 'unknown'}` }),
+        ' ',
+        el('span', { class: 'note', text: [
+          `Last completed ${formatWhen(summary.lastCompletedAtEpoch)}`,
+          `last failed ${formatWhen(summary.lastFailedAtEpoch)}`,
+        ].join(' · ') }),
+      );
+      if (stuck) {
+        health.append(el('div', { class: 'error', text: 'Jobs are queued in the database but the queue is empty. The server and the generation worker may be on different queue prefixes.' }));
+      }
+
+      clear($('pipeline-tiles')).append(
+        tile('Queued', summary.counts.queued),
+        tile('Processing', summary.counts.processing),
+        tile('Completed', summary.counts.completed),
+        tile('Failed', summary.counts.failed, summary.counts.failed > 0),
+        tile('Cancelled', summary.counts.cancelled),
+      );
+
+      const laneTable = clear($('lanes'));
+      laneTable.append(headerRow('Lane', 'Waiting', 'Active', 'Delayed', 'Failed'));
+      if (lanes.length === 0) laneTable.append(el('tr', {}, el('td', { colspan: '5', class: 'note', text: 'No queue lanes reported.' })));
+      for (const lane of lanes) {
+        laneTable.append(el('tr', {},
+          el('td', { text: lane.kind || lane.name || '—' }),
+          ...['waiting', 'active', 'delayed', 'failed'].map(field =>
+            el('td', { class: 'num', text: lane.unavailable ? '—' : String(lane[field] ?? 0) })),
+        ));
+      }
+
+      const failedTable = clear($('failed'));
+      $('failed-status').textContent = failed.total === 0 ? 'No failed jobs.' : `${failed.total} failed. Showing the most recent ${failed.jobs.length}.`;
+      failedTable.hidden = failed.jobs.length === 0;
+      if (failed.jobs.length > 0) failedTable.append(headerRow('Failed', 'Source', 'Attempts', 'Reason', ''));
+      for (const job of failed.jobs) {
+        const reason = job.lastError && (job.lastError.reason || job.lastError.message) || '—';
+        const row = el('tr', {},
+          el('td', { text: formatWhen(job.failedAtEpoch || job.createdAtEpoch) }),
+          el('td', { text: job.sourceType }),
+          el('td', { class: 'num', text: `${job.attempts}/${job.maxAttempts}` }),
+          el('td', { text: String(reason) }),
+        );
+        const actions = el('td', { class: 'actions' });
+        if (state.canWrite) {
+          const retry = el('button', { type: 'button', text: 'Retry' });
+          retry.addEventListener('click', async () => {
+            retry.disabled = true;
+            try { await api('POST', `/v1/jobs/${encodeURIComponent(job.id)}/retry`); row.remove(); }
+            catch (error) { retry.disabled = false; showError(error); }
+          });
+          actions.append(retry);
+        }
+        row.append(actions);
+        failedTable.append(row);
+      }
+    } catch (error) {
+      showError(error);
+    }
+  }
+
+  // ---- Keys ----
+  async function loadKeys() {
+    $('keys-readonly').hidden = state.canWrite;
+    $('keys-body').hidden = !state.canWrite;
+    if (!state.canWrite) return;
+    try {
+      const { keys } = await api('GET', '/v1/keys');
+      const table = clear($('keys'));
+      table.append(headerRow('Key', 'Access', 'Status', 'Created', 'Expires', ''));
+      for (const key of keys) {
+        const access = key.scopes.includes('memories:write') ? 'read + write'
+          : key.scopes.length === 1 && key.scopes[0] === 'memories:read' ? 'read-only'
+          : key.scopes.join(', ') || '—';
+        const statusClass = key.status === 'active' ? 'ok' : key.status === 'expired' ? 'warn' : 'bad';
+        const actions = el('td', { class: 'actions' });
+        if (key.current) actions.append(el('span', { class: 'chip', text: 'this key' }));
+        else if (key.status === 'active') {
+          actions.append(confirmButton('Revoke', async () => {
+            await api('DELETE', `/v1/keys/${encodeURIComponent(key.id)}`);
+            await loadKeys();
+          }));
+        }
+        table.append(el('tr', {},
+          el('td', { class: 'mono', text: shortId(key.id) }),
+          el('td', { text: access }),
+          el('td', {}, el('span', { class: `chip ${statusClass}`, text: key.status })),
+          el('td', { text: formatWhen(key.createdAtEpoch) }),
+          el('td', { text: key.expiresAtEpoch ? new Date(key.expiresAtEpoch).toLocaleDateString() : 'never' }),
+          actions,
+        ));
+      }
+    } catch (error) {
+      showError(error);
+    }
+  }
+
+  function copyButton(text) {
+    const button = el('button', { type: 'button', text: 'Copy' });
+    button.addEventListener('click', async () => {
+      try { await navigator.clipboard.writeText(text); button.textContent = 'Copied'; }
+      catch { button.textContent = 'Select and copy'; }
+    });
+    return button;
+  }
+
+  $('mint-form').addEventListener('submit', async event => {
+    event.preventDefault();
+    clearError();
+    const write = $('mint-scope').value === 'write';
+    const body = { scopes: write ? ['memories:read', 'memories:write'] : ['memories:read'] };
+    if ($('mint-expiry').value) body.expiresInDays = Number($('mint-expiry').value);
+    try {
+      const minted = await api('POST', '/v1/keys', body);
+      const panel = clear($('minted'));
+      panel.append(
+        el('strong', { text: 'New key created. Copy it now; it is not shown again.' }),
+        el('div', { class: 'secret' }, el('code', { text: minted.apiKey }), copyButton(minted.apiKey)),
+        el('div', { class: 'note', text: 'Connect Claude Code for recall:' }),
+        el('div', { class: 'secret' }, el('code', { text: minted.connectCommand }), copyButton(minted.connectCommand)),
+      );
+      panel.hidden = false;
+      await loadKeys();
+    } catch (error) {
+      showError(error);
+    }
+  });
+
+  // ---- Boot ----
+  const savedKey = sessionStorage.getItem(STORAGE_KEY) || localStorage.getItem(STORAGE_KEY);
+  if (savedKey) {
+    signIn(savedKey, localStorage.getItem(STORAGE_KEY) !== null).catch(error => signOut(error.message));
+  } else {
+    $('signin').hidden = false;
+    $('signin-key').focus();
+  }
+})();
+</script>
+</body>
+</html>

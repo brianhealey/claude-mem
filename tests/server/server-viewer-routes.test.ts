@@ -75,5 +75,17 @@ describe('ServerViewerRoutes on the server runtime (#2552)', () => {
       const body = await rootRes.json();
       expect(body.error).toBe('ViewerUnavailable');
     }
+
+    // Same contract for the hosted-server dashboard at /dashboard.
+    const dashboardRes = await fetch(`http://127.0.0.1:${port}/dashboard`);
+    if (ServerViewerRoutes.hasDashboardHtml()) {
+      expect(dashboardRes.status).toBe(200);
+      expect(dashboardRes.headers.get('content-type')).toContain('text/html');
+      expect(dashboardRes.headers.get('cache-control')).toBe('no-store');
+    } else {
+      expect(dashboardRes.status).toBe(503);
+      const body = await dashboardRes.json();
+      expect(body.error).toBe('DashboardUnavailable');
+    }
   });
 });

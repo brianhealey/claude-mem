@@ -43,6 +43,30 @@ if (resolvedViewerHtmlPath) {
   });
 }
 
+// The hosted-server dashboard (src/ui/dashboard.html): a standalone page that
+// reads this server's /v1 API with a pasted API key. Unlike the viewer above,
+// whose /api/* data routes exist only on the worker, it works here.
+const DASHBOARD_HTML_CANDIDATE_PATHS: readonly string[] = (() => {
+  const packageRoot = getPackageRoot();
+  return [
+    path.join(packageRoot, 'ui', 'dashboard.html'),
+    path.join(packageRoot, 'plugin', 'ui', 'dashboard.html'),
+  ];
+})();
+
+const resolvedDashboardHtmlPath: string | null =
+  DASHBOARD_HTML_CANDIDATE_PATHS.find(candidate => existsSync(candidate)) ?? null;
+
+const dashboardHtmlBytes: Buffer | null = resolvedDashboardHtmlPath
+  ? readFileSync(resolvedDashboardHtmlPath)
+  : null;
+
+if (!resolvedDashboardHtmlPath) {
+  logger.warn('SYSTEM', 'dashboard.html not found for server runtime', {
+    candidates: DASHBOARD_HTML_CANDIDATE_PATHS,
+  });
+}
+
 export class ServerViewerRoutes implements RouteHandler {
   setupRoutes(app: Application): void {
     const packageRoot = getPackageRoot();
@@ -60,10 +84,25 @@ export class ServerViewerRoutes implements RouteHandler {
       res.setHeader('Content-Type', 'text/html; charset=utf-8');
       res.send(viewerHtmlBytes);
     });
+
+    app.get('/dashboard', (_req: Request, res: Response) => {
+      if (!dashboardHtmlBytes) {
+        res.status(503).json({ error: 'DashboardUnavailable', message: 'Dashboard UI not found at any expected location' });
+        return;
+      }
+      res.setHeader('Content-Type', 'text/html; charset=utf-8');
+      // The page holds an API key in memory; keep it out of shared caches.
+      res.setHeader('Cache-Control', 'no-store');
+      res.send(dashboardHtmlBytes);
+    });
   }
 
   // Exposed for tests: did the build ship a viewer.html the server can serve?
   static hasViewerHtml(): boolean {
     return viewerHtmlBytes !== null;
+  }
+
+  static hasDashboardHtml(): boolean {
+    return dashboardHtmlBytes !== null;
   }
 }

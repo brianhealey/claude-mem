@@ -137,6 +137,28 @@ wiring the better-auth org → team mapping is the remaining piece, and the bigg
 part of the devex work still ahead.
 </Warning>
 
+## Dashboard
+
+The server serves a dashboard at `<server-base>/dashboard`. Sign in by pasting an
+API key; the page then calls the same `/v1` routes documented here, so it shows
+exactly what that key can reach and nothing more.
+
+| Tab | What it does | Scope needed |
+|-----|--------------|--------------|
+| **Memories** | Browse recent observations, full-text search, filter by session, read one in full, delete one. | `memories:read` (delete needs `memories:write`) |
+| **Pipeline** | Job counts by status, per-lane queue depth, recent failed jobs with their reason, retry. | `memories:read` (retry needs `memories:write`) |
+| **Keys** | List the team's keys, create a read-only or read-and-write key, revoke a key. | `memories:write` |
+
+<Note>
+The key is kept in the browser tab's session storage, or in local storage if you
+tick **Remember on this device**. Serve the dashboard over HTTPS anywhere the
+network is not trusted: the key is sent as a bearer header on every request.
+</Note>
+
+`POST /v1/keys` still mints a read-only key by default. Pass
+`{ "scopes": ["memories:read", "memories:write"] }` to mint one that can also
+capture. `DELETE /v1/keys/:id` revokes a key; a key cannot revoke itself.
+
 ## Paid-readiness: rate limiting, quotas, metering
 
 These guards run **after** auth and are **opt-in via environment variables**. Unset
@@ -246,9 +268,10 @@ All endpoints are mounted under `/v1`; legacy worker routes remain under `/api`.
 ```
 GET    /healthz
 GET    /v1/info
-GET    /v1/projects
-POST   /v1/projects
-GET    /v1/projects/:id
+GET    /dashboard                 # web dashboard (signs in with an API key)
+GET    /v1/whoami                 # team, project scope and scopes of the key
+GET    /v1/projects               # projects the key can read
+GET    /v1/sessions?projectId=    # a project's sessions, newest first
 POST   /v1/sessions/start
 POST   /v1/sessions/:id/end
 GET    /v1/sessions/:id
@@ -256,17 +279,20 @@ POST   /v1/events                 # ?generate= ?wait=
 POST   /v1/events/batch
 GET    /v1/events/:id
 POST   /v1/memories
-GET    /v1/memories/:id
-PATCH  /v1/memories/:id
+GET    /v1/memories?projectId=    # page through observations (limit, offset, serverSessionId)
 DELETE /v1/memories/:id           # forget one observation
 POST   /v1/search
 POST   /v1/context
 ALL    /v1/mcp                    # remote authenticated MCP recall
-POST   /v1/keys                   # mint a read-only key (write scope)
+GET    /v1/jobs                   # generation jobs (status, limit, offset)
+GET    /v1/jobs/summary           # job counts by status
+POST   /v1/jobs/:id/retry
+POST   /v1/keys                   # mint a key (write scope); read-only by default
+GET    /v1/keys                   # list the team's keys, metadata only (write scope)
+DELETE /v1/keys/:id               # revoke a key (write scope)
 GET    /v1/connect                # connect command with key placeholder
 GET    /v1/usage                  # current-month usage totals
 DELETE /v1/projects/:projectId/memory   # purge a whole project
-GET    /v1/audit?projectId=<id>
 ```
 
 ## What's solid vs. what's coming
@@ -276,8 +302,8 @@ GET    /v1/audit?projectId=<id>
 read/write scopes, the `/v1/mcp` recall link, opt-in rate limiting + quotas +
 metering, and audited data deletion. All covered by the Postgres-gated e2e suite.
 
-**Still being built (UX / devex):** a web dashboard for the first-key bootstrap and
-key management, self-serve onboarding, a billing/plan UI on top of the metering
+**Still being built (UX / devex):** a session-gated first-key bootstrap (the
+dashboard manages keys but still needs one to sign in), self-serve onboarding, a billing/plan UI on top of the metering
 primitives, and a smoother "connect Claude Code to my cloud memory" flow than
 pasting a CLI command. These are the next focus — the primitives above are the
 foundation they'll sit on.

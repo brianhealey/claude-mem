@@ -46,6 +46,12 @@ async function buildViewer() {
       path.join(rootDir, 'plugin/ui/tv.html')
     );
 
+    // So is the hosted-server dashboard.
+    fs.copyFileSync(
+      path.join(rootDir, 'src/ui/dashboard.html'),
+      path.join(rootDir, 'plugin/ui/dashboard.html')
+    );
+
     const fontsDir = path.join(rootDir, 'src/ui/viewer/assets/fonts');
     const outputFontsDir = path.join(rootDir, 'plugin/ui/assets/fonts');
 
@@ -74,6 +80,7 @@ async function buildViewer() {
     console.log('  - plugin/ui/viewer-bundle.js');
     console.log('  - plugin/ui/viewer.html (from viewer-template.html)');
     console.log('  - plugin/ui/tv.html (from src/ui/tv.html)');
+    console.log('  - plugin/ui/dashboard.html (from src/ui/dashboard.html)');
     console.log('  - plugin/ui/assets/fonts/* (font files)');
     console.log(`  - plugin/ui/icon-thick-*.svg (${iconFiles.length} icon files)`);
   } catch (error) {

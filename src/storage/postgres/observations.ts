@@ -138,17 +138,19 @@ export class PostgresObservationRepository {
     teamId: string;
     serverSessionId?: string | null;
     limit?: number;
+    offset?: number;
   }): Promise<PostgresObservation[]> {
+    // `id` breaks ties so paging stays stable when rows share a timestamp.
     const result = await this.client.query<ObservationRow>(
       `
         SELECT * FROM observations
         WHERE project_id = $1
           AND team_id = $2
           AND ($3::text IS NULL OR server_session_id = $3)
-        ORDER BY created_at DESC
-        LIMIT $4
+        ORDER BY created_at DESC, id DESC
+        LIMIT $4 OFFSET $5
       `,
-      [input.projectId, input.teamId, input.serverSessionId ?? null, input.limit ?? 100]
+      [input.projectId, input.teamId, input.serverSessionId ?? null, input.limit ?? 100, input.offset ?? 0]
     );
     return result.rows.map(mapObservationRow);
   }
