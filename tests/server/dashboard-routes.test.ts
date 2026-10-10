@@ -397,6 +397,7 @@ describe('dashboard routes', () => {
       body: JSON.stringify({ projectId, query: 'zebra' }),
     });
     await call('POST', '/v1/search', readKey, { projectId, query: 'nothingmatchesthis' });
+    await call('POST', '/v1/context', readKey, { projectId, query: 'nothingmatchesthis' });
     await call('GET', `/v1/memories?projectId=${projectId}`, readKey);
 
     const r = await call('GET', `/v1/value?projectId=${projectId}&days=7`, readKey);
@@ -420,6 +421,8 @@ describe('dashboard routes', () => {
       memoriesRecalled: 2,
       searches: 2,
       emptySearches: 1,
+      contextReads: 2,
+      emptyContextReads: 1,
     });
     expect(body.totals.netTokens).toBe(body.totals.replacedTokens - body.totals.injectedTokens - 700);
     // Everything happened today, the last day of the window.

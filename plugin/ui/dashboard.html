@@ -1329,6 +1329,9 @@
         valueTile('Memories recalled', `${formatCount(t.memoriesRecalled)} of ${formatCount(store.observations)}`,
           store.observations > 0 ? `${Math.round((t.memoriesRecalled / store.observations) * 100)}% used at least once` : ''),
         valueTile('Searches that found something', hitRate, `${formatCount(t.searches)} search${t.searches === 1 ? '' : 'es'}`),
+        valueTile('Session starts given memory',
+          t.contextReads > 0 ? `${Math.round(((t.contextReads - t.emptyContextReads) / t.contextReads) * 100)}%` : '—',
+          `${formatCount(t.emptyContextReads)} of ${formatCount(t.contextReads)} context read${t.contextReads === 1 ? '' : 's'} came back empty`),
         valueTile('Typical age when recalled', formatAge(value.medianAgeAtRecallMs), 'median; older means reuse across sessions'),
       );
 

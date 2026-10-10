@@ -554,15 +554,19 @@ export class ServerV1PostgresRoutes implements RouteHandler {
           `,
           [teamId, projectId],
         ),
-        this.options.pool.query<{ searches: string; empty: string }>(
+        this.options.pool.query<{ searches: string; empty: string; context_reads: string; empty_context: string }>(
           `
-            SELECT count(*) AS searches,
-              count(*) FILTER (WHERE COALESCE((details->>'resultCount')::int, 0) = 0) AS empty
+            SELECT count(*) FILTER (WHERE details->>'mode' = 'search') AS searches,
+              count(*) FILTER (WHERE details->>'mode' = 'search'
+                AND COALESCE((details->>'resultCount')::int, 0) = 0) AS empty,
+              count(*) FILTER (WHERE details->>'mode' <> 'search') AS context_reads,
+              count(*) FILTER (WHERE details->>'mode' <> 'search'
+                AND COALESCE((details->>'resultCount')::int, 0) = 0) AS empty_context
             FROM audit_log
             WHERE team_id = $1 AND project_id = $2 AND action = 'observation.read'
-              AND details->>'mode' = 'search' AND details->>'client' IS NULL AND created_at >= $3
+              AND details->>'mode' = ANY($4::text[]) AND details->>'client' IS NULL AND created_at >= $3
           `,
-          [teamId, projectId, since],
+          [teamId, projectId, since, VALUE_RECALL_MODES],
         ),
       ]);
 
@@ -631,6 +635,8 @@ export class ServerV1PostgresRoutes implements RouteHandler {
           memoriesRecalled: perMemory.size,
           searches: Number(searchRow.rows[0]?.searches ?? 0),
           emptySearches: Number(searchRow.rows[0]?.empty ?? 0),
+          contextReads: Number(searchRow.rows[0]?.context_reads ?? 0),
+          emptyContextReads: Number(searchRow.rows[0]?.empty_context ?? 0),
         },
         store: {
           observations: Number(store?.observations ?? 0),
