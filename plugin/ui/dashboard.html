@@ -1074,7 +1074,10 @@
       const queue = (info.boundaries && info.boundaries.queueManager) || {};
       const lanes = info.queueLanes || [];
       const queueOk = queue.status === 'active';
-      const stuck = summary.counts.queued > 0 && lanes.length > 0 && lanes.every(lane => (lane.waiting || 0) === 0 && (lane.active || 0) === 0);
+      // An event job waits in `delayed` for its batch window, so a queued row
+      // with nothing waiting or active is normal while something is delayed.
+      const stuck = summary.counts.queued > 0 && lanes.length > 0
+        && lanes.every(lane => (lane.waiting || 0) === 0 && (lane.active || 0) === 0 && (lane.delayed || 0) === 0);
       const health = clear($('pipeline-health'));
       health.append(
         el('span', { class: `chip ${queueOk ? 'ok' : 'bad'}`, text: queueOk ? 'queue connected' : `queue ${queue.status || 'unknown'}` }),
