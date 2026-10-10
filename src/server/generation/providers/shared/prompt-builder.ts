@@ -41,6 +41,12 @@ export interface BuildServerPromptResult {
   readonly noEvents: boolean;
 }
 
+const ALREADY_RECORDED_HINT = [
+  'The titles in <already_recorded> are memories this session already has.',
+  'Do not record the same finding again: write an observation only for what',
+  'adds to or corrects them, and return <skip_summary /> if nothing does.',
+].join(' ');
+
 const MAX_PAYLOAD_CHARS = 16 * 1024;
 
 export function buildServerGenerationPrompt(
@@ -85,6 +91,7 @@ export function buildServerGenerationPrompt(
   // <summary> block. Asking for <observation> here yields a response the summary
   // path silently discards, so branch the instruction on the job's source type.
   const isSessionSummary = context.job.sourceType === 'session_summary';
+  const recordedTitles = isSessionSummary ? [] : context.recordedTitles ?? [];
 
   const summaryInstruction = [
     'You are reviewing a complete agent session. Return a single',
@@ -128,9 +135,17 @@ export function buildServerGenerationPrompt(
         ? '    <!-- no agent events were loaded for this session -->'
         : '    <!-- empty after privacy stripping -->',
     '  </agent_events>',
+    ...(recordedTitles.length > 0
+      ? [
+        '  <already_recorded>',
+        ...recordedTitles.map(title => `    <title>${escapeXml(title)}</title>`),
+        '  </already_recorded>',
+      ]
+      : []),
     '</server_beta_observation_request>',
     '',
     ...(isSessionSummary ? summaryInstruction : observationInstruction),
+    ...(recordedTitles.length > 0 ? ['', ALREADY_RECORDED_HINT] : []),
     ...(eventBlocks.some(hasRedactionMarker) ? ['', REDACTION_MARKER_HINT] : []),
   ].join('\n');
 

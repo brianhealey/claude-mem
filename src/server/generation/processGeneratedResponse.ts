@@ -58,6 +58,12 @@ export interface ProcessGeneratedResponseInput {
    * loaded, or plenty was loaded and the model still declined.
    */
   inputEventCount?: number;
+  /**
+   * Other event jobs of the session whose events went into the same call.
+   * They are completed with `job`, and every observation is linked to their
+   * events as well.
+   */
+  batchedJobs?: PostgresObservationGenerationJob[];
   job: PostgresObservationGenerationJob;
   rawText: string;
   modelId?: string;
@@ -255,6 +261,12 @@ export async function processSessionSummaryResponse(
   return persistGeneratedObservations(input, rendered, privateContentDetected, skipReason);
 }
 
+const SESSION_TITLES_CHECKED_FOR_DUPLICATES = 500;
+
+function normalizeTitle(title: string): string {
+  return title.trim().toLowerCase().replace(/\s+/g, ' ');
+}
+
 interface RenderedObservation {
   kind: string;
   content: string;
@@ -311,11 +323,47 @@ async function persistGeneratedObservations(
     // context injection and search facet by folder without isolating memory.
     const sessionProject = await fetchSessionProject(client, fresh.serverSessionId, fresh.id);
 
+    // A batched job cancelled or otherwise moved on while the call ran keeps
+    // its own outcome.
+    const batchedJobs: PostgresObservationGenerationJob[] = [];
+    for (const sibling of input.batchedJobs ?? []) {
+      const current = await jobsRepo.getByIdForScope({
+        id: sibling.id,
+        projectId: fresh.projectId,
+        teamId: fresh.teamId,
+      });
+      if (current?.status === 'processing' && current.agentEventId) {
+        batchedJobs.push(current);
+      }
+    }
+
+    // The prompt asks the model not to repeat the session's memories; this
+    // catches the repeats it writes anyway, by title.
+    const recordedTitles = new Set(
+      fresh.sourceType === 'agent_event' && fresh.serverSessionId
+        ? (await obsRepo.listSessionTitles({
+          serverSessionId: fresh.serverSessionId,
+          projectId: fresh.projectId,
+          teamId: fresh.teamId,
+          limit: SESSION_TITLES_CHECKED_FOR_DUPLICATES,
+        })).map(normalizeTitle)
+        : [],
+    );
+    let duplicateCount = 0;
+
     const persisted: PostgresObservation[] = [];
     for (let index = 0; index < rendered.length; index++) {
       const { kind, content, metadata } = rendered[index]!;
       if (!content || content.trim().length === 0) {
         continue;
+      }
+      if (fresh.sourceType === 'agent_event' && fresh.serverSessionId && typeof metadata.title === 'string') {
+        const titleKey = normalizeTitle(metadata.title);
+        if (titleKey && recordedTitles.has(titleKey)) {
+          duplicateCount += 1;
+          continue;
+        }
+        recordedTitles.add(titleKey);
       }
 
       // Defense-in-depth: even if the parser slipped a private-tagged
@@ -367,6 +415,22 @@ async function persistGeneratedObservations(
           api_key_id: input.apiKeyId ?? null,
         },
       });
+      for (const sibling of batchedJobs) {
+        await sourcesRepo.addSource({
+          observationId: observation.id,
+          projectId: fresh.projectId,
+          teamId: fresh.teamId,
+          sourceType: 'agent_event',
+          sourceId: sibling.agentEventId!,
+          agentEventId: sibling.agentEventId,
+          generationJobId: sibling.id,
+          metadata: {
+            provider: input.providerLabel,
+            parsedObservationIndex: index,
+            batchedInto: fresh.id,
+          },
+        });
+      }
 
       // Phase 11 — audit each generated observation. Using the SAME
       // generation_job_id reference so the audit chain (event_received →
@@ -425,8 +489,33 @@ async function persistGeneratedObservations(
         skipReason,
         workerId: input.workerId ?? null,
         sourceType: fresh.sourceType,
+        ...(batchedJobs.length > 0 ? { batchedJobIds: batchedJobs.map(sibling => sibling.id) } : {}),
+        ...(duplicateCount > 0 ? { duplicateCount } : {}),
       },
     });
+    for (const sibling of batchedJobs) {
+      await jobsRepo.transitionStatus({
+        id: sibling.id,
+        projectId: sibling.projectId,
+        teamId: sibling.teamId,
+        status: 'completed',
+      });
+      await eventsLogRepo.append({
+        generationJobId: sibling.id,
+        projectId: sibling.projectId,
+        teamId: sibling.teamId,
+        eventType: 'completed',
+        statusAfter: 'completed',
+        attempt: sibling.attempts,
+        details: {
+          provider: input.providerLabel,
+          model: input.modelId ?? null,
+          batchedInto: fresh.id,
+          workerId: input.workerId ?? null,
+          sourceType: sibling.sourceType,
+        },
+      });
+    }
 
     // Audit log — best-effort; failure here would already be inside the
     // transaction so any insert error rolls everything back. We accept

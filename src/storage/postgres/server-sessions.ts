@@ -114,6 +114,43 @@ export class PostgresServerSessionsRepository {
     return row ? mapServerSessionRow(row) : null;
   }
 
+  // A session row can exist before the client has said which folder it is in
+  // (the summarize hook creates one with no metadata). Fills the keys the row
+  // lacks and, once it has a folder label, gives that label to the session's
+  // memories written without one: folder-scoped reads cannot see those.
+  async fillMissingMetadata(input: {
+    id: string;
+    projectId: string;
+    teamId: string;
+    metadata: JsonObject;
+  }): Promise<PostgresServerSession | null> {
+    const row = await queryOne<ServerSessionRow>(
+      this.client,
+      `
+        UPDATE server_sessions
+        SET metadata = $4::jsonb || jsonb_strip_nulls(metadata), updated_at = now()
+        WHERE id = $1 AND project_id = $2 AND team_id = $3
+        RETURNING *
+      `,
+      [input.id, input.projectId, input.teamId, JSON.stringify(input.metadata)]
+    );
+    if (!row) return null;
+    const session = mapServerSessionRow(row);
+    const folder = session.metadata.project;
+    if (typeof folder === 'string' && folder.length > 0) {
+      await this.client.query(
+        `
+          UPDATE observations
+          SET metadata = jsonb_set(metadata, '{project}', to_jsonb($4::text)), updated_at = now()
+          WHERE server_session_id = $1 AND project_id = $2 AND team_id = $3
+            AND metadata->>'project' IS NULL
+        `,
+        [input.id, input.projectId, input.teamId, folder]
+      );
+    }
+    return session;
+  }
+
   async listByProject(projectId: string, teamId: string): Promise<PostgresServerSession[]> {
     const result = await this.client.query<ServerSessionRow>(
       `

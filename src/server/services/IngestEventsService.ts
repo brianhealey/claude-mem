@@ -21,6 +21,7 @@ import type { PostgresPool } from '../../storage/postgres/pool.js';
 import { withPostgresTransaction } from '../../storage/postgres/pool.js';
 import { logger } from '../../utils/logger.js';
 import { buildServerJobId } from '../jobs/job-id.js';
+import { resolveGenerationBatchWindowMs } from '../jobs/generation-batching.js';
 import type { GenerateObservationsForEventJob } from '../jobs/types.js';
 import { newId } from '../../storage/postgres/utils.js';
 
@@ -45,6 +46,45 @@ function buildEventBullmqPayload(input: {
     source_adapter: input.sourceAdapter ?? input.event.sourceAdapter ?? 'api',
     request_id: input.requestId,
   };
+}
+
+// Tools whose output is navigation or bookkeeping. Their events are still
+// stored, but a paid generation call on one nearly always returns a memory
+// that only restates the call. CLAUDE_MEM_SERVER_GENERATION_SKIP_TOOLS
+// replaces this list (comma-separated; empty turns the filter off).
+const DEFAULT_GENERATION_SKIP_TOOLS = [
+  'ToolSearch',
+  'Glob',
+  'LS',
+  'TodoWrite',
+  'TaskCreate',
+  'TaskUpdate',
+  'TaskList',
+  'TaskGet',
+  'ListMcpResourcesTool',
+  'ScheduleWakeup',
+  'mcp__serena__get_symbols_overview',
+  'mcp__serena__read_memory',
+  'mcp__serena__list_memories',
+  'mcp__serena__initial_instructions',
+  'mcp__serena__activate_project',
+];
+
+export function resolveGenerationSkipTools(env: NodeJS.ProcessEnv = process.env): Set<string> {
+  const configured = env.CLAUDE_MEM_SERVER_GENERATION_SKIP_TOOLS;
+  const names = configured === undefined ? DEFAULT_GENERATION_SKIP_TOOLS : configured.split(',');
+  return new Set(names.map(name => name.trim().toLowerCase()).filter(Boolean));
+}
+
+export function shouldGenerateForEvent(
+  input: Pick<CreatePostgresAgentEventInput, 'eventType' | 'payload'>,
+  skipTools: Set<string> = resolveGenerationSkipTools(),
+): boolean {
+  if (input.eventType !== 'tool_use' || skipTools.size === 0) return true;
+  const payload = input.payload;
+  if (!payload || typeof payload !== 'object' || Array.isArray(payload)) return true;
+  const toolName = (payload as Record<string, unknown>).tool_name;
+  return typeof toolName !== 'string' || !skipTools.has(toolName.trim().toLowerCase());
 }
 
 const EVENT_JOB_TYPE = 'observation_generate_for_event';
@@ -90,7 +130,7 @@ export class IngestEventsService {
     input: CreatePostgresAgentEventInput,
     opts: IngestEventOptions = {},
   ): Promise<IngestEventResult> {
-    const generate = opts.generate ?? true;
+    const generate = (opts.generate ?? true) && shouldGenerateForEvent(input);
     const source = opts.source ?? 'http_post_v1_events';
 
     const txResult = await withPostgresTransaction(this.options.pool, async (client) => {
@@ -157,7 +197,8 @@ export class IngestEventsService {
     inputs: CreatePostgresAgentEventInput[],
     opts: IngestEventOptions = {},
   ): Promise<IngestEventResult[]> {
-    const generate = opts.generate ?? true;
+    const generateRequested = opts.generate ?? true;
+    const skipTools = resolveGenerationSkipTools();
     const source = opts.source ?? 'http_post_v1_events_batch';
 
     const txResults = await withPostgresTransaction(this.options.pool, async (client) => {
@@ -167,7 +208,7 @@ export class IngestEventsService {
       const acc: { event: PostgresAgentEvent; outbox: PostgresObservationGenerationJob | null }[] = [];
       for (const input of inputs) {
         const event = await eventsRepo.create(input);
-        if (!generate) {
+        if (!generateRequested || !shouldGenerateForEvent(input, skipTools)) {
           acc.push({ event, outbox: null });
           continue;
         }
@@ -235,8 +276,14 @@ export class IngestEventsService {
       source_type: 'agent_event',
       source_id: event.id,
     });
+    // Only a session's events can be batched, so only they wait for neighbours.
+    const delay = event.serverSessionId ? resolveGenerationBatchWindowMs() : 0;
     try {
-      await queue.add(jobId, outbox.payload);
+      if (delay > 0) {
+        await queue.add(jobId, outbox.payload, { delay });
+      } else {
+        await queue.add(jobId, outbox.payload);
+      }
       return 'enqueued';
     } catch (error) {
       logger.warn('SYSTEM', 'failed to publish event generation job to BullMQ', {

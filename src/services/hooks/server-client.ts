@@ -192,6 +192,9 @@ export interface ServerContextObservationsRequest {
   folderProjects?: string[];
   // Leave out rows generated from subagent events (CLAUDE_MEM_CONTEXT_MAIN_AGENT_ONLY).
   excludeSubagents?: boolean;
+  // 'prompt' marks memory injected alongside a user prompt, which the server
+  // counts apart from session-start reads.
+  purpose?: 'prompt';
 }
 
 export interface ServerContextObservationsResponse {
@@ -296,6 +299,7 @@ export class ServerClient {
       payload.folderProjects = input.folderProjects;
     }
     if (input.excludeSubagents !== undefined) payload.excludeSubagents = input.excludeSubagents;
+    if (input.purpose !== undefined) payload.purpose = input.purpose;
     return this.request<ServerContextObservationsResponse>('POST', '/v1/context', payload, options);
   }
 

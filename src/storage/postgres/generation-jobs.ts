@@ -250,6 +250,57 @@ export class PostgresObservationGenerationJobRepository {
     return result.rows.map(mapJobRow);
   }
 
+  // Takes a session's other queued event jobs into `processing` so one
+  // provider call can cover them. Like transitionStatus it counts an attempt:
+  // the event is about to be sent to a paid call. Only jobs ingested with the
+  // same API key are taken, so the caller's revocation check covers them all.
+  async claimQueuedSessionEventJobs(input: {
+    projectId: string;
+    teamId: string;
+    serverSessionId: string;
+    excludeJobId: string;
+    apiKeyId: string | null;
+    lockedBy: string;
+    limit: number;
+  }): Promise<PostgresObservationGenerationJob[]> {
+    if (input.limit <= 0) return [];
+    const result = await this.client.query<JobRow>(
+      `
+        UPDATE observation_generation_jobs
+        SET status = 'processing',
+          attempts = attempts + 1,
+          locked_at = now(),
+          locked_by = $6,
+          next_attempt_at = NULL,
+          last_error = NULL,
+          updated_at = now()
+        WHERE id IN (
+          SELECT id FROM observation_generation_jobs
+          WHERE team_id = $1 AND project_id = $2 AND server_session_id = $3
+            AND source_type = 'agent_event'
+            AND status = 'queued'
+            AND id <> $4
+            AND attempts < max_attempts
+            AND (payload->>'api_key_id') IS NOT DISTINCT FROM $5::text
+          ORDER BY created_at ASC
+          LIMIT $7
+          FOR UPDATE SKIP LOCKED
+        )
+        RETURNING *
+      `,
+      [
+        input.teamId,
+        input.projectId,
+        input.serverSessionId,
+        input.excludeJobId,
+        input.apiKeyId,
+        input.lockedBy,
+        input.limit,
+      ]
+    );
+    return result.rows.map(mapJobRow);
+  }
+
   private async validateSource(input: {
     projectId: string;
     teamId: string;

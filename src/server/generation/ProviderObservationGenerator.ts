@@ -24,6 +24,12 @@ import {
   type ProcessGeneratedResponseOutcome,
 } from './processGeneratedResponse.js';
 import { PostgresServerSessionsRepository } from '../../storage/postgres/server-sessions.js';
+import { resolveGenerationBatchMaxEvents } from '../jobs/generation-batching.js';
+import { PostgresObservationRepository } from '../../storage/postgres/observations.js';
+
+// How many of the session's latest memory titles the model is shown so it
+// does not repeat them. About 15 tokens each.
+const RECORDED_TITLES_IN_PROMPT = 30;
 
 // Phase 11 — sentinel exception class so the worker can distinguish
 // scope-violation/revoked-key failures from generic processor errors and
@@ -79,6 +85,9 @@ export interface ProviderObservationGeneratorOptions {
   // Upper bound on one provider.generate() call. Defaults to
   // DEFAULT_PROVIDER_GENERATE_TIMEOUT_MS; tests pass a small value.
   providerTimeoutMs?: number;
+  // Most events one call may cover. Defaults to
+  // CLAUDE_MEM_SERVER_GENERATION_BATCH_MAX_EVENTS; 1 turns batching off.
+  batchMaxEvents?: number;
 }
 
 // #4100: nothing bounded the provider call, so one hung request held the
@@ -335,8 +344,128 @@ export class ProviderObservationGenerator {
     correlationId: string,
     payloadRequestId: string | null,
   ): Promise<{ jobId: string; status: 'completed'; observationCount: number }> {
-    const events = await this.loadEvents(fresh, payload);
+    const batched = await this.claimBatch(fresh, payload, correlationId);
+    try {
+      const result = await this.generateAndPersistBatch(job, payload, fresh, batched, correlationId, payloadRequestId);
+      await this.settleBatch(batched, null);
+      return result;
+    } catch (error) {
+      await this.settleBatch(batched, error);
+      throw error;
+    }
+  }
+
+  private async claimBatch(
+    fresh: PostgresObservationGenerationJob,
+    payload: ServerGenerationJobPayload,
+    correlationId: string,
+  ): Promise<PostgresObservationGenerationJob[]> {
+    const maxEvents = this.options.batchMaxEvents ?? resolveGenerationBatchMaxEvents();
+    if (payload.kind !== 'event' || fresh.sourceType !== 'agent_event' || !fresh.serverSessionId || maxEvents <= 1) {
+      return [];
+    }
+    try {
+      const batched = await new PostgresObservationGenerationJobRepository(this.options.pool).claimQueuedSessionEventJobs({
+        projectId: fresh.projectId,
+        teamId: fresh.teamId,
+        serverSessionId: fresh.serverSessionId,
+        excludeJobId: fresh.id,
+        apiKeyId: payload.api_key_id ?? null,
+        lockedBy: this.options.workerId ?? 'server-beta-worker',
+        limit: maxEvents - 1,
+      });
+      if (batched.length > 0) {
+        logger.info('SYSTEM', '[generation] batched session event jobs into one call', {
+          correlationId,
+          jobId: fresh.id,
+          batchedJobIds: batched.map(sibling => sibling.id),
+        });
+      }
+      return batched;
+    } catch (error) {
+      // Batching only saves calls; the job itself can still run alone.
+      logger.warn('SYSTEM', '[generation] could not claim a batch; generating for one event', {
+        correlationId,
+        jobId: fresh.id,
+        error: error instanceof Error ? error.message : String(error),
+      });
+      return [];
+    }
+  }
+
+  // After the call, every batched job must leave `processing`. A persisted
+  // batch already completed them, which makes this a no-op. Otherwise each
+  // follows the same never-pay-twice rule as the job that carried it. A
+  // requeued one has no BullMQ delivery of its own left; the carrying job's
+  // retry, or the session's next event job, takes it again.
+  private async settleBatch(batched: PostgresObservationGenerationJob[], error: unknown): Promise<void> {
+    if (batched.length === 0) return;
+    const terminal = error instanceof ServerGenerationTerminalOutcomeError ? error : null;
+    const classified = error instanceof ServerClassifiedProviderError ? error : null;
+    const paidSendOutcome = classified ? serverPaidSendOutcomeOf(classified) : null;
+    for (const sibling of batched) {
+      const retryable = error === null
+        || paidSendOutcome === 'refused_before_work'
+        || (paidSendOutcome === 'ambiguous' && sibling.attempts < SERVER_MAX_PAID_SENDS_PER_JOB);
+      try {
+        await markGenerationFailed({
+          pool: this.options.pool,
+          job: sibling,
+          reason: error === null
+            ? 'batch finished without persisting this event'
+            : error instanceof Error ? error.message : String(error),
+          classification: error === null ? 'batch_released' : terminal?.classification ?? classified?.kind ?? 'unknown',
+          retryable,
+          ...(this.options.workerId !== undefined ? { workerId: this.options.workerId } : {}),
+        });
+      } catch (settleError) {
+        logger.warn('SYSTEM', '[generation] could not settle a batched job', {
+          jobId: sibling.id,
+          error: settleError instanceof Error ? settleError.message : String(settleError),
+        });
+      }
+    }
+  }
+
+  private async loadBatchedEvents(
+    batched: PostgresObservationGenerationJob[],
+  ): Promise<NonNullable<Awaited<ReturnType<PostgresAgentEventsRepository['getByIdForScope']>>>[]> {
+    const repo = new PostgresAgentEventsRepository(this.options.pool);
+    const events = [];
+    for (const sibling of batched) {
+      if (!sibling.agentEventId) continue;
+      const event = await repo.getByIdForScope({
+        id: sibling.agentEventId,
+        projectId: sibling.projectId,
+        teamId: sibling.teamId,
+      });
+      if (event) events.push(event);
+    }
+    return events;
+  }
+
+  private async generateAndPersistBatch(
+    job: Job<ServerGenerationJobPayload>,
+    payload: ServerGenerationJobPayload,
+    fresh: PostgresObservationGenerationJob,
+    batched: PostgresObservationGenerationJob[],
+    correlationId: string,
+    payloadRequestId: string | null,
+  ): Promise<{ jobId: string; status: 'completed'; observationCount: number }> {
+    const ownEvents = await this.loadEvents(fresh, payload);
+    const events = batched.length === 0
+      ? ownEvents
+      : [...ownEvents, ...await this.loadBatchedEvents(batched)]
+        .sort((a, b) => a.occurredAtEpoch - b.occurredAtEpoch);
     const project = await this.loadProject(fresh);
+    const recordedTitles = fresh.sourceType === 'agent_event' && fresh.serverSessionId
+      ? await new PostgresObservationRepository(this.options.pool).listSessionTitles({
+        serverSessionId: fresh.serverSessionId,
+        projectId: fresh.projectId,
+        teamId: fresh.teamId,
+        limit: RECORDED_TITLES_IN_PROMPT,
+      })
+      : [];
 
     const timeoutMs = this.options.providerTimeoutMs ?? DEFAULT_PROVIDER_GENERATE_TIMEOUT_MS;
     const signal = AbortSignal.timeout(timeoutMs);
@@ -351,6 +480,7 @@ export class ProviderObservationGenerator {
           serverSessionId: fresh.serverSessionId,
           projectName: project?.name ?? null,
         },
+        recordedTitles,
       }, signal);
     } catch (error) {
       // An abort can surface from fetch (already transient) or from reading the
@@ -370,6 +500,7 @@ export class ProviderObservationGenerator {
       pool: this.options.pool,
       job: fresh,
       inputEventCount: events.length,
+      batchedJobs: batched,
       rawText: result.rawText,
       modelId: result.modelId,
       providerLabel: result.providerLabel,

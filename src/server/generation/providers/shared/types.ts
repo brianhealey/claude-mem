@@ -15,6 +15,9 @@ export interface ServerGenerationContext {
     readonly serverSessionId: string | null;
     readonly projectName?: string | null;
   };
+  // Titles of the memories this session already has, newest first, so the
+  // model does not record the same finding again.
+  readonly recordedTitles?: readonly string[];
 }
 
 // ServerGenerationResult is the raw provider response (XML accepted by

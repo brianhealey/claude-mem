@@ -113,7 +113,7 @@ afterAll(() => {
 });
 
 describe('sessionInitHandler server semantic injection', () => {
-  it('starts the server session and skips worker semantic injection in server mode', async () => {
+  it('starts the server session and asks the server, not the worker, for prompt context in server mode', async () => {
     const env = { ...process.env };
     delete env.CLAUDE_MEM_INTERNAL;
     const prompt = 'Please restore platform-aware context for this Cursor session.';
@@ -166,8 +166,12 @@ describe('sessionInitHandler server semantic injection', () => {
       if (start.projectId !== 'server-project-1' || start.externalSessionId !== 'session-server-context' || start.contentSessionId !== 'session-server-context' || start.platformSource !== 'cursor') {
         throw new Error('startSession body mismatch: ' + JSON.stringify(start));
       }
-      if (serverCalls.contextObservations.length !== 0) throw new Error('contextObservations should not be called');
-      if (!result.continue || !result.suppressOutput) throw new Error('unexpected result ' + JSON.stringify(result));
+      if (serverCalls.contextObservations.length !== 1) throw new Error('contextObservations count mismatch: ' + serverCalls.contextObservations.length);
+      const lookup = serverCalls.contextObservations[0];
+      if (lookup.projectId !== 'server-project-1' || lookup.query !== ${JSON.stringify(prompt)} || lookup.limit !== 14 || lookup.platformSource !== 'cursor' || lookup.purpose !== 'prompt') {
+        throw new Error('contextObservations body mismatch: ' + JSON.stringify(lookup));
+      }
+      if (!result.continue || !result.suppressOutput || result.hookSpecificOutput) throw new Error('unexpected result ' + JSON.stringify(result));
     `;
 
     const result = Bun.spawnSync({

@@ -69,6 +69,21 @@ interface ObservationSourceRow {
   created_at: Date;
 }
 
+// Fewer whole-query matches than this and a multi-word search is widened.
+const RELAXED_SEARCH_BELOW_RESULTS = 3;
+// Sharing this many distinct terms is enough however long the query is.
+const RELAXED_SEARCH_ENOUGH_TERMS = 4;
+
+export interface ObservationSearchInput {
+  projectId: string;
+  teamId: string;
+  query?: string | null;
+  limit?: number;
+  platformSource?: string | null;
+  folderProjects?: string[] | null;
+  excludeSubagents?: boolean;
+}
+
 export class PostgresObservationRepository {
   constructor(private client: PostgresQueryable) {}
 
@@ -133,6 +148,29 @@ export class PostgresObservationRepository {
     return row ? mapObservationRow(row) : null;
   }
 
+  // Titles of a session's generated memories, newest first. Summaries are a
+  // different kind of record and are left out.
+  async listSessionTitles(input: {
+    serverSessionId: string;
+    projectId: string;
+    teamId: string;
+    limit: number;
+  }): Promise<string[]> {
+    const result = await this.client.query<{ title: string }>(
+      `
+        SELECT metadata->>'title' AS title
+        FROM observations
+        WHERE server_session_id = $1 AND project_id = $2 AND team_id = $3
+          AND kind <> 'summary'
+          AND COALESCE(metadata->>'title', '') <> ''
+        ORDER BY created_at DESC
+        LIMIT $4
+      `,
+      [input.serverSessionId, input.projectId, input.teamId, input.limit]
+    );
+    return result.rows.map(row => row.title);
+  }
+
   async listByProject(input: {
     projectId: string;
     teamId: string;
@@ -188,15 +226,21 @@ export class PostgresObservationRepository {
   // agentId and an agentType (src/shared/subagent-predicate.ts). An agent id
   // alone is main-agent work (transcript-watch seats), and rows with no event
   // source (summaries, direct memories) always stay.
-  async search(input: {
-    projectId: string;
-    teamId: string;
-    query?: string | null;
-    limit?: number;
-    platformSource?: string | null;
-    folderProjects?: string[] | null;
-    excludeSubagents?: boolean;
-  }): Promise<PostgresObservation[]> {
+  // A query is first matched whole: every term, or the text as a substring.
+  // A natural-language question rarely survives that, so when it finds next to
+  // nothing the search is run again accepting rows that hold at least half of
+  // the query's terms (or RELAXED_SEARCH_ENOUGH_TERMS of them, for a query as
+  // long as a prompt), ranked after the whole matches.
+  async search(input: ObservationSearchInput): Promise<PostgresObservation[]> {
+    const strict = await this.runSearch(input, false);
+    const query = input.query?.trim() ?? '';
+    if (strict.length >= RELAXED_SEARCH_BELOW_RESULTS || !/\s/.test(query)) {
+      return strict;
+    }
+    return this.runSearch(input, true);
+  }
+
+  private async runSearch(input: ObservationSearchInput, relaxed: boolean): Promise<PostgresObservation[]> {
     const platformSource = normalizePlatformSourceOrNull(input.platformSource);
     const query = input.query && input.query.trim().length > 0 ? input.query : null;
     const folderProjects = input.folderProjects && input.folderProjects.length > 0
@@ -220,6 +264,18 @@ export class PostgresObservationRepository {
             -- file token, so a search for "registries" misses it. A plain
             -- substring match catches those; such rows rank after FTS hits.
             OR position(lower($3) in lower(observations.content)) > 0
+            OR (
+              $8::boolean
+              AND observations.content_search @@ replace(plainto_tsquery('english', $3)::text, ' & ', ' | ')::tsquery
+              AND cardinality(ARRAY(
+                SELECT unnest(tsvector_to_array(to_tsvector('english', $3)))
+                INTERSECT
+                SELECT unnest(tsvector_to_array(observations.content_search))
+              )) >= LEAST(
+                ${RELAXED_SEARCH_ENOUGH_TERMS},
+                CEIL(cardinality(tsvector_to_array(to_tsvector('english', $3))) / 2.0)
+              )
+            )
           )
           AND (
             $6::text[] IS NULL
@@ -263,6 +319,10 @@ export class PostgresObservationRepository {
         ORDER BY
           CASE WHEN $3::text IS NULL THEN observations.created_at END DESC,
           ts_rank(observations.content_search, websearch_to_tsquery('english', $3)) DESC,
+          CASE WHEN $8::boolean THEN ts_rank(
+            observations.content_search,
+            replace(plainto_tsquery('english', $3)::text, ' & ', ' | ')::tsquery
+          ) END DESC NULLS LAST,
           observations.updated_at DESC
         LIMIT $4
       `,
@@ -274,6 +334,7 @@ export class PostgresObservationRepository {
         platformSource,
         folderProjects,
         input.excludeSubagents === true,
+        relaxed,
       ]
     );
     return result.rows.map(mapObservationRow);

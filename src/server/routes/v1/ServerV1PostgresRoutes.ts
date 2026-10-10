@@ -17,6 +17,7 @@ import {
 } from '../../../storage/postgres/generation-jobs.js';
 import { PostgresAuthRepository } from '../../../storage/postgres/auth.js';
 import { PostgresObservationRepository } from '../../../storage/postgres/observations.js';
+import type { JsonObject } from '../../../storage/postgres/utils.js';
 import { PostgresProjectsRepository } from '../../../storage/postgres/projects.js';
 import { logger } from '../../../utils/logger.js';
 import { requirePostgresServerAuth } from '../../middleware/postgres-auth.js';
@@ -497,7 +498,7 @@ export class ServerV1PostgresRoutes implements RouteHandler {
       const now = new Date();
       const since = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate() - (days - 1)));
 
-      const [recallRows, generationRows, storeRow, searchRow] = await Promise.all([
+      const [recallRows, generationRows, storeRow, searchRow, followUpRow] = await Promise.all([
         // One row per (recall, memory): each time an agent was handed a memory.
         // A memory's source size is its events' payloads, an event shared by
         // several memories split evenly between them.
@@ -554,17 +555,49 @@ export class ServerV1PostgresRoutes implements RouteHandler {
           `,
           [teamId, projectId],
         ),
-        this.options.pool.query<{ searches: string; empty: string; context_reads: string; empty_context: string }>(
+        this.options.pool.query<{
+          searches: string; empty: string; context_reads: string; empty_context: string;
+          prompt_reads: string; empty_prompt: string;
+        }>(
           `
             SELECT count(*) FILTER (WHERE details->>'mode' = 'search') AS searches,
               count(*) FILTER (WHERE details->>'mode' = 'search'
                 AND COALESCE((details->>'resultCount')::int, 0) = 0) AS empty,
-              count(*) FILTER (WHERE details->>'mode' <> 'search') AS context_reads,
               count(*) FILTER (WHERE details->>'mode' <> 'search'
-                AND COALESCE((details->>'resultCount')::int, 0) = 0) AS empty_context
+                AND details->>'purpose' IS DISTINCT FROM 'prompt') AS context_reads,
+              count(*) FILTER (WHERE details->>'mode' <> 'search'
+                AND details->>'purpose' IS DISTINCT FROM 'prompt'
+                AND COALESCE((details->>'resultCount')::int, 0) = 0) AS empty_context,
+              count(*) FILTER (WHERE details->>'purpose' = 'prompt') AS prompt_reads,
+              count(*) FILTER (WHERE details->>'purpose' = 'prompt'
+                AND COALESCE((details->>'resultCount')::int, 0) = 0) AS empty_prompt
             FROM audit_log
             WHERE team_id = $1 AND project_id = $2 AND action = 'observation.read'
               AND details->>'mode' = ANY($4::text[]) AND details->>'client' IS NULL AND created_at >= $3
+          `,
+          [teamId, projectId, since, VALUE_RECALL_MODES],
+        ),
+        // The one sign of use the audit trail holds: a memory handed over
+        // unasked (at session start or with a prompt) that an agent's own
+        // search returned afterwards.
+        this.options.pool.query<{ handed_unasked: string; followed_up: string }>(
+          `
+            WITH handed AS (
+              SELECT jsonb_array_elements_text(details->'observationIds') AS observation_id,
+                created_at, details->>'mode' = 'search' AS searched
+              FROM audit_log
+              WHERE team_id = $1 AND project_id = $2 AND action = 'observation.read'
+                AND details->>'mode' = ANY($4::text[]) AND details->>'client' IS NULL AND created_at >= $3
+                AND jsonb_typeof(details->'observationIds') = 'array'
+            ), per_memory AS (
+              SELECT min(created_at) FILTER (WHERE NOT searched) AS first_unasked,
+                max(created_at) FILTER (WHERE searched) AS last_searched
+              FROM handed
+              GROUP BY observation_id
+            )
+            SELECT count(*) FILTER (WHERE first_unasked IS NOT NULL) AS handed_unasked,
+              count(*) FILTER (WHERE first_unasked IS NOT NULL AND last_searched > first_unasked) AS followed_up
+            FROM per_memory
           `,
           [teamId, projectId, since, VALUE_RECALL_MODES],
         ),
@@ -637,6 +670,10 @@ export class ServerV1PostgresRoutes implements RouteHandler {
           emptySearches: Number(searchRow.rows[0]?.empty ?? 0),
           contextReads: Number(searchRow.rows[0]?.context_reads ?? 0),
           emptyContextReads: Number(searchRow.rows[0]?.empty_context ?? 0),
+          promptReads: Number(searchRow.rows[0]?.prompt_reads ?? 0),
+          emptyPromptReads: Number(searchRow.rows[0]?.empty_prompt ?? 0),
+          memoriesHandedUnasked: Number(followUpRow.rows[0]?.handed_unasked ?? 0),
+          memoriesFollowedUp: Number(followUpRow.rows[0]?.followed_up ?? 0),
         },
         store: {
           observations: Number(store?.observations ?? 0),
@@ -1372,7 +1409,17 @@ export class ServerV1PostgresRoutes implements RouteHandler {
               platformSource,
             });
             if (existing) {
-              res.status(200).json({ session: serializeSession(existing) });
+              const offered = Object.entries(body.metadata ?? {})
+                .filter(([key, value]) => value != null && existing.metadata[key] == null);
+              const filled = offered.length > 0
+                ? await repo.fillMissingMetadata({
+                  id: existing.id,
+                  projectId: existing.projectId,
+                  teamId,
+                  metadata: Object.fromEntries(offered) as JsonObject,
+                })
+                : null;
+              res.status(200).json({ session: serializeSession(filled ?? existing) });
               return;
             }
           }
@@ -1668,6 +1715,9 @@ export class ServerV1PostgresRoutes implements RouteHandler {
         // CLAUDE_MEM_CONTEXT_MAIN_AGENT_ONLY: leave out rows generated from
         // subagent hook events.
         excludeSubagents: z.boolean().optional(),
+        // Set by the prompt hook, so /v1/value can tell memory injected with a
+        // prompt from a session-start read or an agent's own lookup.
+        purpose: z.enum(['prompt']).optional(),
       }),
       async (req, res, body) => {
         const teamId = this.requireTeamId(req, res);
@@ -1707,6 +1757,7 @@ export class ServerV1PostgresRoutes implements RouteHandler {
           platformSource,
           folderProjects: body.folderProjects ?? null,
           excludeSubagents: body.excludeSubagents === true,
+          ...(body.purpose ? { purpose: body.purpose } : {}),
           resultCount: results.length,
           observationIds: results.map(o => o.id),
         });

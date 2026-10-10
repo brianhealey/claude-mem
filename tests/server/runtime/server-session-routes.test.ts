@@ -145,6 +145,43 @@ describe('ServerV1PostgresRoutes Phase 6 session endpoints', () => {
     expect(bJson.session.id).toBe(aJson.session.id);
   });
 
+  it('POST /v1/sessions/start gives an unlabelled session, and its memories, the folder it learns later', async () => {
+    const first = await authedFetch('/v1/sessions/start', {
+      method: 'POST',
+      body: JSON.stringify({ projectId, externalSessionId: 'ext-late-label' }),
+    });
+    const sessionId = (await first.json()).session.id;
+    const unlabelled = await storage.observations.create({
+      projectId, teamId, serverSessionId: sessionId, content: 'written before the label', metadata: { project: null },
+    });
+    const labelled = await storage.observations.create({
+      projectId, teamId, serverSessionId: sessionId, content: 'already labelled', metadata: { project: 'other' },
+    });
+
+    const second = await authedFetch('/v1/sessions/start', {
+      method: 'POST',
+      body: JSON.stringify({ projectId, externalSessionId: 'ext-late-label', metadata: { project: 'claude-mem', prompt: 'hi' } }),
+    });
+    expect(second.status).toBe(200);
+    expect((await second.json()).session.id).toBe(sessionId);
+
+    const third = await authedFetch('/v1/sessions/start', {
+      method: 'POST',
+      body: JSON.stringify({ projectId, externalSessionId: 'ext-late-label', metadata: { project: 'renamed', prompt: 'again' } }),
+    });
+    expect(third.status).toBe(200);
+
+    const rows = await client.query(
+      `SELECT (SELECT metadata FROM server_sessions WHERE id = $1) AS session,
+        (SELECT metadata->>'project' FROM observations WHERE id = $2) AS unlabelled,
+        (SELECT metadata->>'project' FROM observations WHERE id = $3) AS labelled`,
+      [sessionId, unlabelled.id, labelled.id],
+    );
+    expect(rows.rows[0].session).toEqual({ project: 'claude-mem', prompt: 'hi' });
+    expect(rows.rows[0].unlabelled).toBe('claude-mem');
+    expect(rows.rows[0].labelled).toBe('other');
+  });
+
   it('POST /v1/sessions/start scopes external_session_id by normalized platformSource', async () => {
     const cursor = await authedFetch('/v1/sessions/start', {
       method: 'POST',

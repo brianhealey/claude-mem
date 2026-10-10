@@ -207,7 +207,9 @@ describe('server-beta Postgres platform source scoping', () => {
       platformSource: 'Cursor CLI',
     });
 
-    expect(client.calls).toHaveLength(1);
+    // No whole-query match, so the multi-word search runs a second, widened time.
+    expect(client.calls).toHaveLength(2);
+    expect(client.calls[1].values).toEqual(['project-1', 'team-1', 'auth bug', 7, 'cursor', null, false, true]);
     expect(client.calls[0].text).toContain('LEFT JOIN server_sessions');
     expect(client.calls[0].text).toContain('server_sessions.platform_source = $5');
     expect(client.calls[0].text).toContain('observations.server_session_id IS NULL');
@@ -220,6 +222,7 @@ describe('server-beta Postgres platform source scoping', () => {
       7,
       'cursor',
       null,
+      false,
       false,
     ]);
   });
@@ -247,6 +250,7 @@ describe('server-beta Postgres platform source scoping', () => {
       50,
       'cursor',
       ['alpha'],
+      false,
       false,
     ]);
   });

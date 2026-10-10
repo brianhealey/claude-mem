@@ -371,6 +371,35 @@ describe('dashboard routes', () => {
     expect((await (await call('GET', '/v1/audit', otherTeamKey)).json() as Trail).entries).toHaveLength(0);
   });
 
+  it('GET /v1/value counts prompt injections apart and the memories searched for after being handed over', async () => {
+    await storage.observations.create({ projectId, teamId, content: 'Quokka deploy steps' });
+    await storage.observations.create({ projectId, teamId, content: 'Quokka rollback steps' });
+
+    // A session start hands over both memories, a prompt brings them again and
+    // another prompt matches nothing; the agent then searches for one of them.
+    await call('POST', '/v1/context', readKey, { projectId });
+    await call('POST', '/v1/context', readKey, { projectId, query: 'quokka', purpose: 'prompt' });
+    await call('POST', '/v1/context', readKey, { projectId, query: 'nothingmatchesthis', purpose: 'prompt' });
+    await call('POST', '/v1/search', readKey, { projectId, query: 'deploy' });
+
+    const r = await call('GET', `/v1/value?projectId=${projectId}&days=7`, readKey);
+    expect(r.status).toBe(200);
+    const body = await r.json() as { totals: Record<string, number> };
+    expect(body.totals).toMatchObject({
+      searches: 1,
+      emptySearches: 0,
+      contextReads: 1,
+      emptyContextReads: 0,
+      promptReads: 2,
+      emptyPromptReads: 1,
+      memoriesHandedUnasked: 2,
+      memoriesFollowedUp: 1,
+    });
+
+    const bad = await call('POST', '/v1/context', readKey, { projectId, purpose: 'anything-else' });
+    expect(bad.status).toBe(400);
+  });
+
   it('GET /v1/value weighs generation and injection against what recall replaced', async () => {
     // A 4,000-character tool output distilled into a 400-character memory.
     const event = await storage.agentEvents.create({
@@ -423,6 +452,11 @@ describe('dashboard routes', () => {
       emptySearches: 1,
       contextReads: 2,
       emptyContextReads: 1,
+      promptReads: 0,
+      emptyPromptReads: 0,
+      // The search came before the context read, so nothing was followed up.
+      memoriesHandedUnasked: 2,
+      memoriesFollowedUp: 0,
     });
     expect(body.totals.netTokens).toBe(body.totals.replacedTokens - body.totals.injectedTokens - 700);
     // Everything happened today, the last day of the window.

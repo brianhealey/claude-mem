@@ -232,9 +232,27 @@ const sessionInit = {
             Math.floor(sessionInitTimeoutMs / SESSION_INIT_SERVER_TIMEOUT_DIVISOR),
           ),
         );
-        // Server does not currently support the same context-injection
-        // protocol as the worker. Skip semantic injection in server mode
-        // until the server context endpoint exists.
+        if (semanticInject && prompt.length >= 20 && prompt !== '[media prompt]') {
+          const remainingMs = remainingSessionInitTimeoutMs(sessionInitStartedAt, sessionInitTimeoutMs);
+          const additionalContext = remainingMs < SESSION_INIT_MIN_REMAINING_TIMEOUT_MS
+            ? ''
+            : await fetchServerPromptContext(runtime, {
+              sessionId,
+              prompt,
+              folderProjects: projectContext.allProjects,
+              limit: parseSemanticInjectLimit(settings.CLAUDE_MEM_SEMANTIC_INJECT_LIMIT || '5'),
+              platformSource,
+              excludeSubagents: String(settings.CLAUDE_MEM_CONTEXT_MAIN_AGENT_ONLY).toLowerCase() === 'true',
+              timeoutMs: remainingMs,
+            });
+          if (additionalContext) {
+            return {
+              continue: true,
+              suppressOutput: true,
+              hookSpecificOutput: { hookEventName: 'UserPromptSubmit', additionalContext },
+            };
+          }
+        }
         return { continue: true, suppressOutput: true };
       } catch (error: unknown) {
         if (isServerClientError(error) && error.isFallbackEligible()) {
@@ -387,6 +405,74 @@ async function startServerSession(
     contentSessionId: sessionId,
     project,
   });
+}
+
+// A prompt is searched by its opening: the store matches on shared terms, and
+// the first few sentences say what the prompt is about.
+const SERVER_PROMPT_QUERY_MAX_CHARS = 600;
+const SERVER_PROMPT_MEMORY_MAX_CHARS = 700;
+
+/**
+ * Memories relevant to the prompt, from the server store. Rows written by this
+ * very session are left out: the agent already has that work in its context.
+ * Fail-open: any error means no injection, never a blocked prompt.
+ */
+async function fetchServerPromptContext(
+  runtime: ServerRuntimeContext,
+  request: {
+    sessionId: string;
+    prompt: string;
+    folderProjects: string[];
+    limit: number;
+    platformSource: string;
+    excludeSubagents: boolean;
+    timeoutMs: number;
+  },
+): Promise<string> {
+  let rows: Awaited<ReturnType<ServerRuntimeContext['client']['contextObservations']>>['observations'];
+  try {
+    const result = await runtime.client.contextObservations({
+      projectId: runtime.projectId,
+      query: request.prompt.slice(0, SERVER_PROMPT_QUERY_MAX_CHARS),
+      // Over-read, since this session's own rows are dropped below.
+      limit: request.limit * 2,
+      folderProjects: request.folderProjects,
+      excludeSubagents: request.excludeSubagents,
+      platformSource: request.platformSource,
+      purpose: 'prompt',
+    }, { timeoutMs: request.timeoutMs });
+    rows = Array.isArray(result?.observations) ? result.observations : [];
+  } catch (error) {
+    logger.debug('HOOK', 'session-init: prompt context unavailable from the server', {
+      error: error instanceof Error ? error.message : String(error),
+    });
+    return '';
+  }
+
+  const relevant = rows
+    .filter(row => row.contentSessionId !== request.sessionId && row.kind !== 'summary')
+    .slice(0, request.limit);
+  if (relevant.length === 0) return '';
+
+  const lines: string[] = ['## Relevant Past Work (matched to this prompt)\n'];
+  for (const row of relevant) {
+    const metadata = (row.metadata && typeof row.metadata === 'object' ? row.metadata : {}) as Record<string, unknown>;
+    const title = typeof metadata.title === 'string' && metadata.title.trim()
+      ? metadata.title.trim()
+      : row.content.split('\n', 1)[0]!.trim() || 'Observation';
+    const date = typeof row.createdAtEpoch === 'number'
+      ? new Date(row.createdAtEpoch).toISOString().slice(0, 10)
+      : '';
+    const body = typeof metadata.narrative === 'string' && metadata.narrative.trim()
+      ? metadata.narrative.trim()
+      : row.content.trim();
+    lines.push(`### ${title}${date ? ` (${date})` : ''}`);
+    lines.push(body.length > SERVER_PROMPT_MEMORY_MAX_CHARS
+      ? `${body.slice(0, SERVER_PROMPT_MEMORY_MAX_CHARS)}…`
+      : body);
+    lines.push('');
+  }
+  return lines.join('\n');
 }
 
 function parseSemanticInjectLimit(value: string | number): number {

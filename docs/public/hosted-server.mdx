@@ -148,7 +148,7 @@ exactly what that key can reach and nothing more.
 | **Memories** | Browse recent observations (new ones appear as they are generated), search with matches highlighted, filter by folder, kind, session or date, read one in full, export as JSON or Markdown. Write, edit or delete one. | `memories:read` (write, edit and delete need `memories:write`) |
 | **Sessions** | List sessions; open one to see its summary and a timeline of captured events, each with the memories generated from it and its raw payload on request. | `memories:read` |
 | **Pipeline** | Job counts by status, the provider and model last used, median capture-to-memory time, token and memory usage, per-lane queue depth, failed jobs grouped by reason, retry one or all. | `memories:read` (retry needs `memories:write`) |
-| **Value** | What memory costs against what it plausibly saves: tokens spent generating (measured), tokens handed back to agents and the raw tool output those memories stand in for (both estimated from text length), per day, with compression, recall counts, how many searches and session-start context reads came back empty, and the most-recalled memories. | `memories:read` |
+| **Value** | What memory costs against what it plausibly saves: tokens spent generating (measured), tokens handed back to agents and the raw tool output those memories stand in for (both estimated from text length), per day, with compression, recall counts, how many searches, session-start context reads and prompt lookups came back empty, how many memories handed over unasked were later searched for, and the most-recalled memories. | `memories:read` |
 | **Keys** | List the team's keys with their label and when each was last used, create a read-only or read-and-write key, revoke a key. | `memories:write` |
 | **Audit** | The team's audit trail: reads and searches, memories written, edited and deleted, keys created and revoked, jobs retried. | `memories:write` |
 
@@ -177,7 +177,21 @@ generation worker only writes when it runs with `CLAUDE_MEM_USAGE_METERING=1`.
 
 `/v1/search` matches on the full-text index and also on a plain substring, so a
 word inside a file name such as `registries.yaml` is found; substring-only
-matches rank after full-text hits.
+matches rank after full-text hits. A query of several words that fewer than
+three memories match whole is widened: memories holding at least half of its
+terms (four are always enough) are added after the whole matches. This is still
+term matching, not semantic search.
+
+With `CLAUDE_MEM_SEMANTIC_INJECT=true` in the client's settings, the prompt hook
+asks `/v1/context` for memories matching each prompt (up to
+`CLAUDE_MEM_SEMANTIC_INJECT_LIMIT`, default 5) and injects them, leaving out
+memories the current session wrote itself. These reads are marked
+`purpose: "prompt"` in the audit trail.
+
+The Value tab's "Handed over, then searched for" counts memories given to an
+agent unasked (at session start or with a prompt) that an agent's own search
+returned afterwards. It is the only sign of use the audit trail holds, and a
+lower bound: an agent can use a memory without searching for it.
 
 `POST /v1/keys` still mints a read-only key by default, and takes an optional
 `label`. Pass
@@ -264,6 +278,35 @@ to N jobs in parallel **per lane**. Both lanes use the value, so one worker proc
 can have up to 2N provider calls in flight. Size N against your provider's rate
 limit. Values above 64 are clamped to 64, and invalid values are ignored with a
 warning.
+
+### Fewer generation calls
+
+Three things keep the worker from making one provider call per tool call.
+
+**Skipped tools.** Events from navigation and bookkeeping tools (`Glob`, `LS`,
+`ToolSearch`, `TodoWrite`, the task-list tools, and Serena's overview and
+memory-reading tools) are stored but get no generation job. Set
+`CLAUDE_MEM_SERVER_GENERATION_SKIP_TOOLS` on the **server** to a comma-separated
+list of tool names to replace the default list, or to an empty string to
+generate for every tool.
+
+**Batching.** An event that belongs to a session is published to the queue
+with a delay, and the first of a session's event jobs to run takes the session's
+other queued event jobs with it, so one call covers several events. Every memory
+from that call is linked to all of the events it covered, and each event's job
+completes together.
+
+| Setting | Set on | Default | Effect |
+|---------|--------|---------|--------|
+| `CLAUDE_MEM_SERVER_GENERATION_BATCH_WINDOW_MS` | server | `30000` | How long an event waits for its neighbours (0 to 300000). Memories appear this much later. `0` publishes immediately. |
+| `CLAUDE_MEM_SERVER_GENERATION_BATCH_MAX_EVENTS` | generation worker | `8` | Most events one call covers (1 to 32). `1` keeps one call per event. |
+
+If a batched call fails, every job in it follows the same retry rule as the job
+that carried it.
+
+**Repeats.** The model is shown the titles of the memories the session already
+has and asked not to record the same finding again; a memory whose title
+repeats one of them is dropped.
 
 ### Custom generation provider (advanced)
 
