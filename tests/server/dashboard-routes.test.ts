@@ -281,6 +281,96 @@ describe('dashboard routes', () => {
     expect((await call('GET', `/v1/sessions/${session.id}/events`, otherTeamKey)).status).toBe(404);
   });
 
+  it('keys carry a label and record when they were last used', async () => {
+    const minted = await (await call('POST', '/v1/keys', writeKey, { label: '  laptop recall ' })).json() as { id: string; apiKey: string; label: string };
+    expect(minted.label).toBe('laptop recall');
+    type Listed = { keys: Array<{ id: string; label: string | null; lastUsedAtEpoch: number | null }> };
+    const before = await (await call('GET', '/v1/keys', writeKey)).json() as Listed;
+    expect(before.keys.find(k => k.id === minted.id)).toMatchObject({ label: 'laptop recall', lastUsedAtEpoch: null });
+
+    expect((await call('GET', '/v1/whoami', minted.apiKey)).status).toBe(200);
+    // The stamp is written without blocking the request, so wait for it.
+    let used: number | null = null;
+    for (let i = 0; i < 40 && used === null; i += 1) {
+      await new Promise(resolve => setTimeout(resolve, 25));
+      const now = await (await call('GET', '/v1/keys', writeKey)).json() as Listed;
+      used = now.keys.find(k => k.id === minted.id)?.lastUsedAtEpoch ?? null;
+    }
+    expect(used).not.toBeNull();
+    expect(Date.now() - (used as number)).toBeLessThan(60_000);
+  });
+
+  it('PATCH /v1/memories/:id edits content and kind, and the edit is searchable', async () => {
+    const created = await storage.observations.create({ projectId, teamId, content: 'the old wording', kind: 'discovery' });
+    const r = await call('PATCH', `/v1/memories/${created.id}`, writeKey, { content: 'the corrected zebrafish wording', kind: 'decision' });
+    expect(r.status).toBe(200);
+    expect((await r.json() as { memory: Record<string, unknown> }).memory).toMatchObject({
+      id: created.id, content: 'the corrected zebrafish wording', kind: 'decision',
+    });
+    const found = await (await call('POST', '/v1/search', readKey, { projectId, query: 'zebrafish' })).json() as { observations: Array<{ id: string }> };
+    expect(found.observations.map(o => o.id)).toEqual([created.id]);
+
+    // Kind alone leaves the content untouched.
+    const kindOnly = await (await call('PATCH', `/v1/memories/${created.id}`, writeKey, { kind: 'bugfix' })).json() as { memory: { content: string; kind: string } };
+    expect(kindOnly.memory).toMatchObject({ content: 'the corrected zebrafish wording', kind: 'bugfix' });
+
+    expect((await call('PATCH', `/v1/memories/${created.id}`, writeKey, {})).status).toBe(400);
+    expect([401, 403]).toContain((await call('PATCH', `/v1/memories/${created.id}`, readKey, { kind: 'x' })).status);
+    expect((await call('PATCH', `/v1/memories/${created.id}`, otherTeamKey, { kind: 'x' })).status).toBe(404);
+    expect((await call('PATCH', '/v1/memories/no-such-id', writeKey, { kind: 'x' })).status).toBe(404);
+  });
+
+  it('POST /v1/search finds a word inside a file-like token', async () => {
+    const fileish = await storage.observations.create({ projectId, teamId, content: 'three nodes lacked registries.yaml' });
+    await storage.observations.create({ projectId, teamId, content: 'unrelated note about postgres' });
+    const body = await (await call('POST', '/v1/search', readKey, { projectId, query: 'registries' })).json() as { observations: Array<{ id: string }> };
+    expect(body.observations.map(o => o.id)).toEqual([fileish.id]);
+    // LIKE wildcards in the query are literal text, not patterns.
+    const wildcard = await (await call('POST', '/v1/search', readKey, { projectId, query: '%' })).json() as { observations: unknown[] };
+    expect(wildcard.observations).toHaveLength(0);
+  });
+
+  it('GET /v1/memories filters by creation time, and /head reports count and newest', async () => {
+    const old = await storage.observations.create({ projectId, teamId, content: 'old' });
+    const recent = await storage.observations.create({ projectId, teamId, content: 'recent' });
+    await client.query("UPDATE observations SET created_at = '2026-01-10T00:00:00Z' WHERE id = $1", [old.id]);
+    await client.query("UPDATE observations SET created_at = '2026-03-10T00:00:00Z' WHERE id = $1", [recent.id]);
+    const cutoff = Date.parse('2026-02-01T00:00:00Z');
+    type Page = { observations: Array<{ content: string }> };
+    const after = await (await call('GET', `/v1/memories?projectId=${projectId}&createdAfter=${cutoff}`, readKey)).json() as Page;
+    expect(after.observations.map(o => o.content)).toEqual(['recent']);
+    const before = await (await call('GET', `/v1/memories?projectId=${projectId}&createdBefore=${cutoff}`, readKey)).json() as Page;
+    expect(before.observations.map(o => o.content)).toEqual(['old']);
+
+    const head = await call('GET', `/v1/memories/head?projectId=${projectId}`, readKey);
+    expect(head.status).toBe(200);
+    expect(await head.json()).toEqual({ observationCount: 2, latestCreatedAtEpoch: Date.parse('2026-03-10T00:00:00Z') });
+    // Polling the head is not itself a recorded read.
+    const audits = await client.query("SELECT count(*)::int AS n FROM audit_log WHERE details->>'mode' = 'list'");
+    expect(audits.rows[0].n).toBe(2);
+  });
+
+  it('GET /v1/audit lists the team\'s trail to write keys only', async () => {
+    const created = await storage.observations.create({ projectId, teamId, content: 'to be deleted' });
+    await call('POST', '/v1/search', readKey, { projectId, query: 'deleted' });
+    await call('DELETE', `/v1/memories/${created.id}`, writeKey);
+    type Trail = { entries: Array<{ action: string; resourceId: string | null; apiKeyId: string; details: Record<string, unknown> }>; hasMore: boolean };
+    const trail = await (await call('GET', '/v1/audit', writeKey)).json() as Trail;
+    expect(trail.entries.map(e => e.action)).toEqual(['observation.deleted', 'observation.read']);
+    expect(trail.entries[0]).toMatchObject({ resourceId: created.id, apiKeyId: writeKeyId });
+    expect(trail.entries[1]).toMatchObject({ apiKeyId: readKeyId, details: { mode: 'search', query: 'deleted' } });
+
+    const onlyDeletes = await (await call('GET', '/v1/audit?action=observation.deleted', writeKey)).json() as Trail;
+    expect(onlyDeletes.entries).toHaveLength(1);
+    const paged = await (await call('GET', '/v1/audit?limit=1', writeKey)).json() as Trail;
+    expect(paged.entries).toHaveLength(1);
+    expect(paged.hasMore).toBe(true);
+
+    expect([401, 403]).toContain((await call('GET', '/v1/audit', readKey)).status);
+    // The other team sees none of it.
+    expect((await (await call('GET', '/v1/audit', otherTeamKey)).json() as Trail).entries).toHaveLength(0);
+  });
+
   describe('failed jobs', () => {
     const seedFailedJob = async (reason: string) => {
       const event = await storage.agentEvents.create({

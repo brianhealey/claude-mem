@@ -55,6 +55,8 @@ const SESSION_EVENT_LIST_MAX_LIMIT = 500;
 // How many recent completed jobs the capture-to-memory median is taken over.
 const JOB_LATENCY_SAMPLE_SIZE = 50;
 const BULK_RETRY_MAX_JOBS = 200;
+const AUDIT_LIST_DEFAULT_LIMIT = 100;
+const AUDIT_LIST_MAX_LIMIT = 500;
 
 declare const __DEFAULT_PACKAGE_VERSION__: string;
 const MCP_SERVER_VERSION =
@@ -241,13 +243,14 @@ export class ServerV1PostgresRoutes implements RouteHandler {
           actorId: req.authContext?.apiKeyId ?? 'api',
           scopes,
           expiresAt,
+          label: body.label ?? null,
         });
-        void body.label; // reserved for when api_keys grows a label column
         await this.auditWrite(req, 'api_key.created', key.id, req.authContext?.projectId ?? null, { scopes });
         const mcpUrl = mcpConnectUrl(req);
         res.status(201).json({
           id: key.id,
           apiKey: raw, // shown ONCE — store it now
+          label: body.label?.trim() || null,
           scopes,
           expiresAt: expiresAt?.toISOString() ?? null,
           mcpUrl,
@@ -293,7 +296,7 @@ export class ServerV1PostgresRoutes implements RouteHandler {
       const projectScope = req.authContext?.projectId ?? null;
       const result = await this.options.pool.query<ApiKeyListRow>(
         `
-          SELECT id, project_id, actor_id, scopes, revoked_at, expires_at, created_at
+          SELECT id, project_id, actor_id, label, scopes, revoked_at, expires_at, last_used_at, created_at
           FROM api_keys
           WHERE team_id = $1 AND ($2::text IS NULL OR project_id = $2)
           ORDER BY created_at DESC
@@ -438,6 +441,78 @@ export class ServerV1PostgresRoutes implements RouteHandler {
       });
     }));
 
+    // GET /v1/memories/head?projectId= — how many observations a project has
+    // and when the newest was created. Carries no content, so a page can poll
+    // it for "is there anything new" without each poll being a recorded read.
+    app.get('/v1/memories/head', readAuth, this.asyncHandler(async (req, res) => {
+      const teamId = this.requireTeamId(req, res);
+      if (!teamId) return;
+      const projectId = typeof req.query.projectId === 'string' ? req.query.projectId : '';
+      if (!projectId) {
+        res.status(400).json({ error: 'ValidationError', message: 'projectId required' });
+        return;
+      }
+      if (!this.ensureProjectAllowed(req, res, projectId)) return;
+      const result = await this.options.pool.query<{ count: string; latest: Date | null }>(
+        'SELECT count(*) AS count, max(created_at) AS latest FROM observations WHERE project_id = $1 AND team_id = $2',
+        [projectId, teamId],
+      );
+      const row = result.rows[0];
+      res.status(200).json({
+        observationCount: Number(row?.count ?? 0),
+        latestCreatedAtEpoch: row?.latest ? new Date(row.latest).getTime() : null,
+      });
+    }));
+
+    // GET /v1/audit — the team's audit trail, newest first: who read, wrote,
+    // deleted or minted what. writeAuth, because the trail itself says what
+    // was searched for and by which key.
+    app.get('/v1/audit', writeAuth, this.asyncHandler(async (req, res) => {
+      const teamId = this.requireTeamId(req, res);
+      if (!teamId) return;
+      const projectScope = req.authContext?.projectId ?? null;
+      const limit = clampListLimit(req.query.limit, AUDIT_LIST_DEFAULT_LIMIT, AUDIT_LIST_MAX_LIMIT);
+      const offset = clampListOffset(req.query.offset);
+      const action = typeof req.query.action === 'string' && req.query.action ? req.query.action : null;
+      const result = await this.options.pool.query<{
+        id: string; project_id: string | null; actor_id: string | null; api_key_id: string | null;
+        key_label: string | null; action: string; resource_type: string; resource_id: string | null;
+        details: unknown; created_at: Date;
+      }>(
+        `
+          SELECT audit_log.id, audit_log.project_id, audit_log.actor_id, audit_log.api_key_id,
+            api_keys.label AS key_label, audit_log.action, audit_log.resource_type,
+            audit_log.resource_id, audit_log.details, audit_log.created_at
+          FROM audit_log
+          LEFT JOIN api_keys ON api_keys.id = audit_log.api_key_id
+          WHERE audit_log.team_id = $1
+            AND ($2::text IS NULL OR audit_log.project_id = $2)
+            AND ($3::text IS NULL OR audit_log.action = $3)
+          ORDER BY audit_log.created_at DESC, audit_log.id DESC
+          LIMIT $4 OFFSET $5
+        `,
+        [teamId, projectScope, action, limit + 1, offset],
+      );
+      const page = result.rows.slice(0, limit);
+      res.status(200).json({
+        entries: page.map(row => ({
+          id: row.id,
+          projectId: row.project_id,
+          actorId: row.actor_id,
+          apiKeyId: row.api_key_id,
+          apiKeyLabel: row.key_label,
+          action: row.action,
+          resourceType: row.resource_type,
+          resourceId: row.resource_id,
+          details: row.details && typeof row.details === 'object' ? row.details : {},
+          createdAtEpoch: new Date(row.created_at).getTime(),
+        })),
+        limit,
+        offset,
+        hasMore: result.rows.length > limit,
+      });
+    }));
+
     // GET /v1/memories?projectId= — page through a project's observations,
     // newest first, optionally one session's. The browse path: /v1/search and
     // /v1/context answer a question, this lists what is stored.
@@ -457,10 +532,13 @@ export class ServerV1PostgresRoutes implements RouteHandler {
         : null;
       const folder = typeof req.query.folder === 'string' && req.query.folder ? req.query.folder : null;
       const kind = typeof req.query.kind === 'string' && req.query.kind ? req.query.kind : null;
+      // Epoch milliseconds: createdAfter is inclusive, createdBefore exclusive.
+      const createdAfter = parseEpochQuery(req.query.createdAfter);
+      const createdBefore = parseEpochQuery(req.query.createdBefore);
       // One row past the page tells the caller whether another page exists
       // without a second count query.
       const rows = await new PostgresObservationRepository(this.options.pool).listByProject({
-        projectId, teamId, serverSessionId, folder, kind, limit: limit + 1, offset,
+        projectId, teamId, serverSessionId, folder, kind, createdAfter, createdBefore, limit: limit + 1, offset,
       });
       const page = rows.slice(0, limit);
       await this.auditWrite(req, 'observation.read', null, projectId, {
@@ -1512,6 +1590,55 @@ export class ServerV1PostgresRoutes implements RouteHandler {
     app.post('/v1/mcp', readAuth, mcpHandler);
     app.get('/v1/mcp', readAuth, mcpHandler);
 
+    // PATCH /v1/memories/:id — correct an observation's text or kind. The
+    // search index follows `content` (a generated column), so an edit is
+    // searchable at once. Scoped like the delete below.
+    app.patch('/v1/memories/:id', writeAuth, this.handleCreate(
+      z.object({
+        content: z.string().min(1).optional(),
+        kind: z.string().min(1).max(64).optional(),
+      }).refine(body => body.content !== undefined || body.kind !== undefined, {
+        message: 'content or kind required',
+      }),
+      async (req, res, body) => {
+        const teamId = this.requireTeamId(req, res);
+        if (!teamId) return;
+        const id = String(req.params.id);
+        const projectScope = req.authContext?.projectId ?? null;
+        try {
+          const result = await this.options.pool.query<{ project_id: string }>(
+            `
+              UPDATE observations
+              SET content = COALESCE($4, content), kind = COALESCE($5, kind), updated_at = now()
+              WHERE id = $1 AND team_id = $2 AND ($3::text IS NULL OR project_id = $3)
+              RETURNING project_id
+            `,
+            [id, teamId, projectScope, body.content ?? null, body.kind ?? null],
+          );
+          const projectId = result.rows[0]?.project_id;
+          if (!projectId) {
+            res.status(404).json({ error: 'not_found' });
+            return;
+          }
+          const updated = await new PostgresObservationRepository(this.options.pool)
+            .getByIdForScope({ id, projectId, teamId });
+          if (!updated) {
+            res.status(404).json({ error: 'not_found' });
+            return;
+          }
+          await this.auditWrite(req, 'observation.updated', id, projectId, {
+            via: 'api',
+            fields: Object.keys(body),
+          });
+          res.status(200).json({ memory: serializeObservation(updated) });
+        } catch (error) {
+          const err = error instanceof Error ? error : new Error(String(error));
+          logger.warn('SYSTEM', 'observation.update failed', { requestId: req.requestId ?? null }, err);
+          this.handleDbError(err, res, 'observation.update');
+        }
+      },
+    ));
+
     // DELETE /v1/memories/:id — forget a single observation (sources cascade).
     app.delete('/v1/memories/:id', writeAuth, this.asyncHandler(async (req, res) => {
       const teamId = this.requireTeamId(req, res);
@@ -2233,9 +2360,11 @@ interface ApiKeyListRow {
   id: string;
   project_id: string | null;
   actor_id: string;
+  label: string | null;
   scopes: unknown;
   revoked_at: Date | null;
   expires_at: Date | null;
+  last_used_at: Date | null;
   created_at: Date;
 }
 
@@ -2245,11 +2374,13 @@ function serializeApiKeyListEntry(row: ApiKeyListRow, callerKeyId: string | null
     id: row.id,
     projectId: row.project_id,
     actorId: row.actor_id,
+    label: row.label,
     scopes: Array.isArray(row.scopes) ? row.scopes : [],
     status: row.revoked_at ? 'revoked' : expired ? 'expired' : 'active',
     createdAtEpoch: new Date(row.created_at).getTime(),
     expiresAtEpoch: row.expires_at ? new Date(row.expires_at).getTime() : null,
     revokedAtEpoch: row.revoked_at ? new Date(row.revoked_at).getTime() : null,
+    lastUsedAtEpoch: row.last_used_at ? new Date(row.last_used_at).getTime() : null,
     current: row.id === callerKeyId,
   };
 }
@@ -2284,6 +2415,11 @@ function clampListLimit(raw: unknown, fallback: number, max: number): number {
   const parsed = typeof raw === 'string' ? Number.parseInt(raw, 10) : Number.NaN;
   if (!Number.isFinite(parsed) || parsed <= 0) return fallback;
   return Math.min(parsed, max);
+}
+
+function parseEpochQuery(raw: unknown): Date | null {
+  const parsed = typeof raw === 'string' ? Number(raw) : Number.NaN;
+  return Number.isFinite(parsed) && parsed > 0 ? new Date(parsed) : null;
 }
 
 function clampListOffset(raw: unknown): number {
@@ -2407,6 +2543,8 @@ function resolveAuditResourceType(action: string): string {
     'session.end': 'server_session',
     'memory.write': 'observation',
     'observation.read': 'observation',
+    'observation.updated': 'observation',
+    'observation.deleted': 'observation',
     'observation.search': 'observation',
     'observation.context': 'observation',
     'observation.generated': 'observation',

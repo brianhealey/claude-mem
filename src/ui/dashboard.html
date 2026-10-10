@@ -160,6 +160,17 @@
   td.actions { text-align: right; white-space: nowrap; }
   .tablewrap { overflow-x: auto; }
 
+  label.inline { display: inline-flex; gap: 6px; align-items: center; color: var(--dim); font-size: 14px; }
+  textarea {
+    font: inherit; color: inherit; width: 100%; resize: vertical;
+    border: 1px solid var(--line); background: var(--panel); border-radius: 6px; padding: 8px 10px;
+  }
+  .editor { display: grid; gap: 10px; }
+  .editor .toolbar { margin-bottom: 0; }
+  mark { background: color-mix(in srgb, var(--accent) 35%, transparent); color: inherit; border-radius: 2px; }
+  .memory.fresh { border-color: var(--accent); }
+  td.details { color: var(--dim); font-size: 13px; overflow-wrap: anywhere; }
+
   /* sessions */
   tr.clickable { cursor: pointer; }
   tr.clickable:hover td { background: var(--chip); }
@@ -201,6 +212,7 @@
       <button role="tab" data-tab="sessions" aria-selected="false">Sessions</button>
       <button role="tab" data-tab="pipeline" aria-selected="false">Pipeline</button>
       <button role="tab" data-tab="keys" aria-selected="false">Keys</button>
+      <button role="tab" data-tab="audit" aria-selected="false">Audit</button>
     </nav>
     <div class="spacer"></div>
     <select id="project" aria-label="Project"></select>
@@ -220,6 +232,30 @@
         <button type="submit">Search</button>
         <button type="button" id="search-clear" class="quiet" hidden>Clear</button>
       </form>
+      <div class="toolbar">
+        <label class="inline">From <input id="date-from" type="date" aria-label="Created on or after"></label>
+        <label class="inline">To <input id="date-to" type="date" aria-label="Created on or before"></label>
+        <span class="grow"></span>
+        <select id="export" aria-label="Export">
+          <option value="">Export…</option>
+          <option value="json">Export as JSON</option>
+          <option value="markdown">Export as Markdown</option>
+        </select>
+        <button type="button" id="memory-new" hidden>New memory</button>
+      </div>
+      <form id="memory-form" class="banner editor" hidden>
+        <div class="toolbar">
+          <input id="memory-form-kind" list="kind-options" placeholder="Kind (e.g. decision)" aria-label="Kind">
+          <input id="memory-form-folder" list="folder-options" placeholder="Folder (optional)" aria-label="Folder">
+        </div>
+        <textarea id="memory-form-content" rows="6" placeholder="First line is the title. The rest is the body." aria-label="Memory text" required></textarea>
+        <div class="toolbar">
+          <button type="submit" class="primary">Save memory</button>
+          <button type="button" id="memory-form-cancel" class="quiet">Cancel</button>
+        </div>
+      </form>
+      <datalist id="kind-options"></datalist>
+      <datalist id="folder-options"></datalist>
       <p id="memories-status" class="note"></p>
       <div id="memories"></div>
       <button id="memories-more" hidden>Load more</button>
@@ -266,6 +302,7 @@
       <div id="keys-body">
         <div id="minted" class="minted" hidden></div>
         <form id="mint-form" class="toolbar">
+          <input id="mint-label" class="grow" maxlength="120" placeholder="Label (e.g. laptop hooks)" aria-label="Label">
           <select id="mint-scope" aria-label="Access">
             <option value="read">Read-only (recall)</option>
             <option value="write">Read and write (capture)</option>
@@ -281,6 +318,27 @@
         <div class="tablewrap"><table id="keys"></table></div>
       </div>
     </section>
+    <section id="tab-audit" hidden>
+      <p id="audit-readonly" class="banner" hidden>This key is read-only. The audit trail needs a key with write access.</p>
+      <div id="audit-body">
+        <div class="toolbar">
+          <select id="audit-action" aria-label="Action">
+            <option value="">All actions</option>
+            <option value="observation.read">Reads and searches</option>
+            <option value="memory.write">Memories written by hand</option>
+            <option value="observation.updated">Memories edited</option>
+            <option value="observation.deleted">Memories deleted</option>
+            <option value="project.memory_purged">Projects purged</option>
+            <option value="api_key.created">Keys created</option>
+            <option value="api_key.revoked">Keys revoked</option>
+            <option value="generation_job.retried_by_operator">Jobs retried</option>
+          </select>
+          <p id="audit-status" class="note grow"></p>
+        </div>
+        <div class="tablewrap"><table id="audit"></table></div>
+        <button id="audit-more" hidden>Load more</button>
+      </div>
+    </section>
   </main>
 </div>
 
@@ -291,6 +349,9 @@
   const STORAGE_KEY = 'claude-mem.dashboard.apiKey';
   const PAGE_SIZE = 50;
   const PIPELINE_REFRESH_MS = 10000;
+  const MEMORIES_REFRESH_MS = 10000;
+  const EXPORT_PAGE_SIZE = 200;
+  const AUDIT_PAGE_SIZE = 100;
   const $ = id => document.getElementById(id);
 
   const state = {
@@ -302,6 +363,10 @@
     offset: 0,
     query: '',
     memoriesRun: 0,
+    shownIds: new Set(),
+    latestSeen: null,
+    memoriesTimer: null,
+    auditOffset: 0,
     pipelineTimer: null,
   };
 
@@ -332,6 +397,29 @@
     return date.toLocaleString(undefined, { dateStyle: 'medium', timeStyle: 'short' });
   }
   const shortId = id => (id ? String(id).slice(0, 8) : '—');
+
+  // Put `text` into `node`, wrapping each occurrence of a search term in
+  // <mark>. Built from text nodes, so nothing in `text` is parsed as markup.
+  function setHighlighted(node, text, terms) {
+    clear(node);
+    const wanted = terms.filter(term => term.length > 1).map(term => term.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'));
+    if (wanted.length === 0) { node.textContent = text; return; }
+    const pattern = new RegExp(`(${wanted.join('|')})`, 'gi');
+    for (const [index, part] of String(text).split(pattern).entries()) {
+      if (!part) continue;
+      node.append(index % 2 === 1 ? el('mark', { text: part }) : part);
+    }
+  }
+  const searchTerms = () => (state.query ? [state.query, ...state.query.split(/\s+/)] : []);
+
+  const filtersActive = () => ['session-filter', 'folder-filter', 'kind-filter', 'date-from', 'date-to'].some(id => $(id).value);
+
+  // Local-midnight bounds of the date inputs, as epoch ms; null when unset.
+  function dateRange() {
+    const from = $('date-from').value ? new Date(`${$('date-from').value}T00:00:00`).getTime() : null;
+    const to = $('date-to').value ? new Date(`${$('date-to').value}T00:00:00`).getTime() + 86400000 : null;
+    return { from, to };
+  }
   const formatCount = value => Number(value).toLocaleString();
   function formatDuration(ms) {
     if (ms < 1000) return `${ms} ms`;
@@ -397,6 +485,7 @@
     sessionStorage.removeItem(STORAGE_KEY);
     localStorage.removeItem(STORAGE_KEY);
     clearInterval(state.pipelineTimer);
+    clearInterval(state.memoriesTimer);
     Object.assign(state, { apiKey: null, who: null, canWrite: false, projectId: null });
     $('app').hidden = true;
     $('signin').hidden = false;
@@ -456,14 +545,18 @@
     state.tab = tab;
     clearError();
     clearInterval(state.pipelineTimer);
+    clearInterval(state.memoriesTimer);
     for (const button of document.querySelectorAll('nav [role=tab]')) {
       button.setAttribute('aria-selected', String(button.dataset.tab === tab));
     }
-    for (const name of ['memories', 'sessions', 'pipeline', 'keys']) $(`tab-${name}`).hidden = name !== tab;
+    for (const name of ['memories', 'sessions', 'pipeline', 'keys', 'audit']) $(`tab-${name}`).hidden = name !== tab;
     if (tab === 'memories') {
+      $('memory-new').hidden = !state.canWrite;
       Promise.all([loadSessions(), loadFolders()]).catch(showError);
       reloadMemories();
+      state.memoriesTimer = setInterval(() => { if (!document.hidden) checkForNewMemories(); }, MEMORIES_REFRESH_MS);
     }
+    if (tab === 'audit') reloadAudit();
     if (tab === 'sessions') loadSessionList();
     if (tab === 'pipeline') {
       loadPipeline();
@@ -505,38 +598,77 @@
     };
     fill($('folder-filter'), 'All folders', folders.filter(f => f.folder).map(f => ({ value: f.folder, count: f.observationCount })));
     fill($('kind-filter'), 'All kinds', kinds.map(k => ({ value: k.kind, count: k.observationCount })));
+    clear($('folder-options')).append(...folders.filter(f => f.folder).map(f => el('option', { value: f.folder })));
+    clear($('kind-options')).append(...kinds.map(k => el('option', { value: k.kind })));
   }
 
   function memoryCard(observation) {
-    const [firstLine, ...rest] = String(observation.content || '').split('\n');
-    const bodyText = rest.join('\n').trim();
-    const body = el('div', { class: 'body', hidden: true });
     const card = el('article', { class: 'memory' });
-    const row = el('button', { class: 'row', type: 'button', 'aria-expanded': 'false' },
-      el('span', { class: 'chip', text: observation.kind || 'memory' }),
-      el('span', { class: 'title', text: firstLine || '(empty)' }),
-      el('span', { class: 'when', text: [
-        observation.metadata && observation.metadata.project,
-        formatWhen(observation.createdAtEpoch),
-      ].filter(Boolean).join(' · ') }),
-    );
-    row.addEventListener('click', () => {
-      body.hidden = !body.hidden;
-      row.setAttribute('aria-expanded', String(!body.hidden));
-    });
-    const meta = el('div', { class: 'meta' },
-      el('span', { text: new Date(observation.createdAtEpoch).toLocaleString() }),
-      observation.metadata && observation.metadata.project ? el('span', { class: 'chip', text: observation.metadata.project }) : null,
-      observation.serverSessionId ? el('span', { class: 'mono', text: `session ${shortId(observation.serverSessionId)}` }) : null,
-      el('span', { class: 'mono', text: `id ${shortId(observation.id)}` }),
-      el('span', { class: 'spacer' }),
-      state.canWrite ? confirmButton('Delete', async () => {
-        await api('DELETE', `/v1/memories/${encodeURIComponent(observation.id)}`);
-        card.remove();
-      }) : null,
-    );
-    body.append(el('pre', { text: bodyText || firstLine }), meta);
-    card.append(row, body);
+    const render = () => {
+      const [firstLine, ...rest] = String(observation.content || '').split('\n');
+      const bodyText = rest.join('\n').trim();
+      const wasOpen = card.querySelector('.body') ? !card.querySelector('.body').hidden : false;
+      const terms = searchTerms();
+      const body = el('div', { class: 'body', hidden: !wasOpen });
+      const title = el('span', { class: 'title' });
+      setHighlighted(title, firstLine || '(empty)', terms);
+      const row = el('button', { class: 'row', type: 'button', 'aria-expanded': String(wasOpen) },
+        el('span', { class: 'chip', text: observation.kind || 'memory' }),
+        title,
+        el('span', { class: 'when', text: [
+          observation.metadata && observation.metadata.project,
+          formatWhen(observation.createdAtEpoch),
+        ].filter(Boolean).join(' · ') }),
+      );
+      row.addEventListener('click', () => {
+        body.hidden = !body.hidden;
+        row.setAttribute('aria-expanded', String(!body.hidden));
+      });
+      const text = el('pre');
+      setHighlighted(text, bodyText || firstLine, terms);
+      const edited = observation.updatedAtEpoch - observation.createdAtEpoch > 1000;
+      const meta = el('div', { class: 'meta' },
+        el('span', { text: new Date(observation.createdAtEpoch).toLocaleString() }),
+        edited ? el('span', { text: `edited ${formatWhen(observation.updatedAtEpoch)}` }) : null,
+        observation.metadata && observation.metadata.project ? el('span', { class: 'chip', text: observation.metadata.project }) : null,
+        observation.serverSessionId ? el('span', { class: 'mono', text: `session ${shortId(observation.serverSessionId)}` }) : null,
+        el('span', { class: 'mono', text: `id ${shortId(observation.id)}` }),
+        el('span', { class: 'spacer' }),
+        state.canWrite ? el('button', { class: 'quiet', type: 'button', text: 'Edit', onclick: () => edit(body) }) : null,
+        state.canWrite ? confirmButton('Delete', async () => {
+          await api('DELETE', `/v1/memories/${encodeURIComponent(observation.id)}`);
+          state.shownIds.delete(observation.id);
+          card.remove();
+        }) : null,
+      );
+      body.append(text, meta);
+      card.replaceChildren(row, body);
+    };
+    // Swap the body for an editor; saving PATCHes and re-renders the card.
+    const edit = body => {
+      const kind = el('input', { value: observation.kind || '', list: 'kind-options', 'aria-label': 'Kind' });
+      const content = el('textarea', { rows: '10', 'aria-label': 'Memory text' });
+      content.value = observation.content || '';
+      const save = el('button', { class: 'primary', type: 'button', text: 'Save' });
+      save.addEventListener('click', async () => {
+        if (!content.value.trim()) return;
+        save.disabled = true;
+        try {
+          const { memory } = await api('PATCH', `/v1/memories/${encodeURIComponent(observation.id)}`, {
+            content: content.value, kind: kind.value.trim() || observation.kind,
+          });
+          Object.assign(observation, memory);
+          render();
+        } catch (error) { save.disabled = false; showError(error); }
+      });
+      body.replaceChildren(el('div', { class: 'editor' },
+        kind, content,
+        el('div', { class: 'toolbar' }, save, el('button', { class: 'quiet', type: 'button', text: 'Cancel', onclick: render })),
+      ));
+      content.focus();
+    };
+    card.observation = observation;
+    render();
     return card;
   }
 
@@ -545,6 +677,7 @@
     // Two filters changed in quick succession start two loads; only the
     // newest may render, or its rows land under the older one's.
     state.memoriesRun += 1;
+    state.shownIds = new Set();
     clear($('memories'));
     await loadMemories();
   }
@@ -569,21 +702,34 @@
         if (sessionId) observations = observations.filter(o => o.serverSessionId === sessionId);
         if (folder) observations = observations.filter(o => String((o.metadata && o.metadata.project) || '').toLowerCase() === folder);
         if (kind) observations = observations.filter(o => o.kind === kind);
+        const { from, to } = dateRange();
+        if (from) observations = observations.filter(o => o.createdAtEpoch >= from);
+        if (to) observations = observations.filter(o => o.createdAtEpoch < to);
       } else {
         const params = new URLSearchParams({ projectId: state.projectId, limit: String(PAGE_SIZE), offset: String(state.offset) });
         if ($('session-filter').value) params.set('serverSessionId', $('session-filter').value);
         if ($('folder-filter').value) params.set('folder', $('folder-filter').value);
         if ($('kind-filter').value) params.set('kind', $('kind-filter').value);
+        const { from, to } = dateRange();
+        if (from) params.set('createdAfter', String(from));
+        if (to) params.set('createdBefore', String(to));
         ({ observations, hasMore } = await api('GET', `/v1/memories?${params}`));
       }
       if (run !== state.memoriesRun) return;
       const list = $('memories');
-      for (const observation of observations) list.append(memoryCard(observation));
+      for (const observation of observations) {
+        if (state.shownIds.has(observation.id)) continue;
+        state.shownIds.add(observation.id);
+        list.append(memoryCard(observation));
+        if (!state.latestSeen || observation.createdAtEpoch > state.latestSeen) state.latestSeen = observation.createdAtEpoch;
+      }
       state.offset += observations.length;
       more.hidden = !hasMore;
       const shown = list.childElementCount;
       status.textContent = shown === 0
-        ? (state.query ? `Nothing matches “${state.query}”.` : 'No memories yet. They appear here as sessions are captured.')
+        ? (state.query ? `Nothing matches “${state.query}”.`
+          : filtersActive() ? 'Nothing matches these filters.'
+          : 'No memories yet. They appear here as sessions are captured.')
         : (state.query ? `${shown} result${shown === 1 ? '' : 's'} for “${state.query}”` : `Showing ${shown} most recent`);
     } catch (error) {
       if (run !== state.memoriesRun) return;
@@ -604,7 +750,117 @@
     $('search-clear').hidden = true;
     reloadMemories();
   });
-  for (const id of ['session-filter', 'folder-filter', 'kind-filter']) $(id).addEventListener('change', reloadMemories);
+  for (const id of ['session-filter', 'folder-filter', 'kind-filter', 'date-from', 'date-to']) $(id).addEventListener('change', reloadMemories);
+
+  // Live refresh. /v1/memories/head carries no content, so polling it is not
+  // logged as a read; the list itself is fetched only when the head has moved.
+  // Skipped while searching: new rows have no rank among the results.
+  async function checkForNewMemories() {
+    if (state.query || !state.projectId) return;
+    const run = state.memoriesRun;
+    try {
+      const head = await api('GET', `/v1/memories/head?projectId=${encodeURIComponent(state.projectId)}`);
+      if (!head.latestCreatedAtEpoch || (state.latestSeen && head.latestCreatedAtEpoch <= state.latestSeen)) return;
+      const params = new URLSearchParams({ projectId: state.projectId, limit: String(PAGE_SIZE) });
+      if ($('session-filter').value) params.set('serverSessionId', $('session-filter').value);
+      if ($('folder-filter').value) params.set('folder', $('folder-filter').value);
+      if ($('kind-filter').value) params.set('kind', $('kind-filter').value);
+      const { from, to } = dateRange();
+      if (from) params.set('createdAfter', String(from));
+      if (to) params.set('createdBefore', String(to));
+      const { observations } = await api('GET', `/v1/memories?${params}`);
+      if (run !== state.memoriesRun) return;
+      state.latestSeen = head.latestCreatedAtEpoch;
+      const list = $('memories');
+      // Oldest of the new ones first, so prepending leaves the newest on top.
+      for (const observation of observations.filter(o => !state.shownIds.has(o.id)).reverse()) {
+        state.shownIds.add(observation.id);
+        const card = memoryCard(observation);
+        card.classList.add('fresh');
+        list.prepend(card);
+        state.offset += 1;
+      }
+      if (list.childElementCount > 0) $('memories-status').textContent = `Showing ${list.childElementCount} most recent`;
+    } catch { /* a missed poll is retried on the next tick */ }
+  }
+
+  // ---- New memory ----
+  $('memory-new').addEventListener('click', () => {
+    $('memory-form').hidden = !$('memory-form').hidden;
+    if (!$('memory-form').hidden) {
+      $('memory-form-folder').value = $('folder-filter').value;
+      $('memory-form-content').focus();
+    }
+  });
+  $('memory-form-cancel').addEventListener('click', () => { $('memory-form').hidden = true; });
+  $('memory-form').addEventListener('submit', async event => {
+    event.preventDefault();
+    clearError();
+    const folder = $('memory-form-folder').value.trim();
+    try {
+      await api('POST', '/v1/memories', {
+        projectId: state.projectId,
+        kind: $('memory-form-kind').value.trim() || 'manual',
+        content: $('memory-form-content').value,
+        ...(folder ? { metadata: { project: folder } } : {}),
+      });
+      $('memory-form').reset();
+      $('memory-form').hidden = true;
+      loadFolders().catch(showError);
+      await reloadMemories();
+    } catch (error) {
+      showError(error);
+    }
+  });
+
+  // ---- Export ----
+  // Everything the current filters select, not just the rows on screen.
+  async function collectForExport() {
+    const { from, to } = dateRange();
+    if (state.query) {
+      return [...$('memories').querySelectorAll('.memory')].map(card => card.observation).filter(Boolean);
+    }
+    const all = [];
+    for (let offset = 0; ; offset += EXPORT_PAGE_SIZE) {
+      const params = new URLSearchParams({ projectId: state.projectId, limit: String(EXPORT_PAGE_SIZE), offset: String(offset) });
+      if ($('session-filter').value) params.set('serverSessionId', $('session-filter').value);
+      if ($('folder-filter').value) params.set('folder', $('folder-filter').value);
+      if ($('kind-filter').value) params.set('kind', $('kind-filter').value);
+      if (from) params.set('createdAfter', String(from));
+      if (to) params.set('createdBefore', String(to));
+      const { observations, hasMore } = await api('GET', `/v1/memories?${params}`);
+      all.push(...observations);
+      if (!hasMore) return all;
+    }
+  }
+  function toMarkdown(observations) {
+    return observations.map(observation => {
+      const [title, ...rest] = String(observation.content || '').split('\n');
+      const facts = [observation.kind, observation.metadata && observation.metadata.project, new Date(observation.createdAtEpoch).toISOString()]
+        .filter(Boolean).join(' · ');
+      return `## ${title}\n\n_${facts}_\n\n${rest.join('\n').trim()}\n`;
+    }).join('\n---\n\n');
+  }
+  $('export').addEventListener('change', async event => {
+    const format = event.target.value;
+    event.target.value = '';
+    if (!format) return;
+    clearError();
+    $('memories-status').textContent = 'Preparing export…';
+    try {
+      const observations = await collectForExport();
+      const text = format === 'json' ? JSON.stringify(observations, null, 2) : toMarkdown(observations);
+      const url = URL.createObjectURL(new Blob([text], { type: format === 'json' ? 'application/json' : 'text/markdown' }));
+      const link = el('a', { href: url, download: `claude-mem-${new Date().toISOString().slice(0, 10)}.${format === 'json' ? 'json' : 'md'}` });
+      document.body.append(link);
+      link.click();
+      link.remove();
+      URL.revokeObjectURL(url);
+      $('memories-status').textContent = `Exported ${observations.length} memor${observations.length === 1 ? 'y' : 'ies'}.`;
+    } catch (error) {
+      showError(error);
+    }
+  });
   $('memories-more').addEventListener('click', loadMemories);
 
   // ---- Sessions ----
@@ -891,7 +1147,7 @@
     try {
       const { keys } = await api('GET', '/v1/keys');
       const table = clear($('keys'));
-      table.append(headerRow('Key', 'Access', 'Status', 'Created', 'Expires', ''));
+      table.append(headerRow('Key', 'Access', 'Status', 'Last used', 'Created', 'Expires', ''));
       for (const key of keys) {
         const access = key.scopes.includes('memories:write') ? 'read + write'
           : key.scopes.length === 1 && key.scopes[0] === 'memories:read' ? 'read-only'
@@ -906,9 +1162,10 @@
           }));
         }
         table.append(el('tr', {},
-          el('td', { class: 'mono', text: shortId(key.id) }),
+          el('td', {}, key.label ? el('div', { text: key.label }) : null, el('div', { class: 'mono note', text: shortId(key.id) })),
           el('td', { text: access }),
           el('td', {}, el('span', { class: `chip ${statusClass}`, text: key.status })),
+          el('td', { text: key.lastUsedAtEpoch ? formatWhen(key.lastUsedAtEpoch) : 'never' }),
           el('td', { text: formatWhen(key.createdAtEpoch) }),
           el('td', { text: key.expiresAtEpoch ? new Date(key.expiresAtEpoch).toLocaleDateString() : 'never' }),
           actions,
@@ -918,6 +1175,58 @@
       showError(error);
     }
   }
+
+  // ---- Audit ----
+  // One line saying what an audit entry was about, from its details.
+  function describeAudit(entry) {
+    const d = entry.details || {};
+    const parts = [];
+    if (d.mode) parts.push(d.via ? `${d.mode} via ${d.via}` : d.mode);
+    if (d.query) parts.push(`“${d.query}”`);
+    if (typeof d.resultCount === 'number') parts.push(`${d.resultCount} result${d.resultCount === 1 ? '' : 's'}`);
+    if (Array.isArray(d.scopes)) parts.push(d.scopes.join(', '));
+    if (Array.isArray(d.fields)) parts.push(`changed ${d.fields.join(', ')}`);
+    if (d.outcome) parts.push(d.outcome);
+    if (typeof d.observations === 'number') parts.push(`${d.observations} memories removed`);
+    if (entry.resourceId) parts.push(`${entry.resourceType} ${shortId(entry.resourceId)}`);
+    return parts.join(' · ') || entry.resourceType;
+  }
+
+  async function reloadAudit() {
+    $('audit-readonly').hidden = state.canWrite;
+    $('audit-body').hidden = !state.canWrite;
+    if (!state.canWrite) return;
+    state.auditOffset = 0;
+    clear($('audit')).append(headerRow('When', 'Action', 'Key', 'What'));
+    await loadAudit();
+  }
+
+  async function loadAudit() {
+    $('audit-status').textContent = 'Loading…';
+    try {
+      const params = new URLSearchParams({ limit: String(AUDIT_PAGE_SIZE), offset: String(state.auditOffset) });
+      if ($('audit-action').value) params.set('action', $('audit-action').value);
+      const { entries, hasMore } = await api('GET', `/v1/audit?${params}`);
+      const table = $('audit');
+      for (const entry of entries) {
+        table.append(el('tr', {},
+          el('td', { text: new Date(entry.createdAtEpoch).toLocaleString(), title: new Date(entry.createdAtEpoch).toISOString() }),
+          el('td', { text: entry.action }),
+          el('td', {}, entry.apiKeyLabel ? el('div', { text: entry.apiKeyLabel }) : null,
+            el('div', { class: 'mono note', text: entry.apiKeyId ? shortId(entry.apiKeyId) : (entry.actorId || '—') })),
+          el('td', { class: 'details', text: describeAudit(entry) }),
+        ));
+      }
+      state.auditOffset += entries.length;
+      $('audit-more').hidden = !hasMore;
+      $('audit-status').textContent = state.auditOffset === 0 ? 'No audit entries.' : `${state.auditOffset} entr${state.auditOffset === 1 ? 'y' : 'ies'}, newest first`;
+    } catch (error) {
+      $('audit-status').textContent = '';
+      showError(error);
+    }
+  }
+  $('audit-action').addEventListener('change', reloadAudit);
+  $('audit-more').addEventListener('click', loadAudit);
 
   function copyButton(text) {
     const button = el('button', { type: 'button', text: 'Copy' });
@@ -934,6 +1243,7 @@
     const write = $('mint-scope').value === 'write';
     const body = { scopes: write ? ['memories:read', 'memories:write'] : ['memories:read'] };
     if ($('mint-expiry').value) body.expiresInDays = Number($('mint-expiry').value);
+    if ($('mint-label').value.trim()) body.label = $('mint-label').value.trim();
     try {
       const minted = await api('POST', '/v1/keys', body);
       const panel = clear($('minted'));
@@ -944,6 +1254,7 @@
         el('div', { class: 'secret' }, el('code', { text: minted.connectCommand }), copyButton(minted.connectCommand)),
       );
       panel.hidden = false;
+      $('mint-label').value = '';
       await loadKeys();
     } catch (error) {
       showError(error);

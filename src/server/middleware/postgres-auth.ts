@@ -159,6 +159,13 @@ export async function verifyPostgresApiKey(
   if (!hasRequiredScopes(scopes, requiredScopes)) {
     return null;
   }
+  // Best effort and at most one write a minute per key, so a busy key does not
+  // turn every authenticated read into a row update.
+  void pool.query(
+    `UPDATE api_keys SET last_used_at = now()
+      WHERE id = $1 AND (last_used_at IS NULL OR last_used_at < now() - interval '1 minute')`,
+    [row.id],
+  ).catch(() => {});
   return {
     apiKeyId: row.id,
     teamId: row.team_id,

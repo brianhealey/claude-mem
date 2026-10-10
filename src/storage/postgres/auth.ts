@@ -66,6 +66,7 @@ export class PostgresAuthRepository {
     actorId: string;
     scopes?: unknown[];
     expiresAt?: Date | null;
+    label?: string | null;
   }): Promise<PostgresApiKey> {
     if (input.projectId && input.teamId) {
       await assertProjectOwnership(this.client, input.projectId, input.teamId);
@@ -74,8 +75,8 @@ export class PostgresAuthRepository {
     const row = await queryOne<ApiKeyRow>(
       this.client,
       `
-        INSERT INTO api_keys (id, key_hash, team_id, project_id, actor_id, scopes, expires_at)
-        VALUES ($1, $2, $3, $4, $5, $6::jsonb, $7)
+        INSERT INTO api_keys (id, key_hash, team_id, project_id, actor_id, scopes, expires_at, label)
+        VALUES ($1, $2, $3, $4, $5, $6::jsonb, $7, $8)
         RETURNING *
       `,
       [
@@ -85,7 +86,8 @@ export class PostgresAuthRepository {
         input.projectId ?? null,
         input.actorId,
         JSON.stringify(input.scopes ?? []),
-        input.expiresAt ?? null
+        input.expiresAt ?? null,
+        input.label?.trim() || null
       ]
     );
     return mapApiKeyRow(row!);

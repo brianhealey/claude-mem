@@ -139,6 +139,8 @@ export class PostgresObservationRepository {
     serverSessionId?: string | null;
     folder?: string | null;
     kind?: string | null;
+    createdAfter?: Date | null;
+    createdBefore?: Date | null;
     limit?: number;
     offset?: number;
   }): Promise<PostgresObservation[]> {
@@ -152,12 +154,15 @@ export class PostgresObservationRepository {
           AND ($3::text IS NULL OR server_session_id = $3)
           AND ($6::text IS NULL OR lower((metadata->>'project') COLLATE "C") = lower($6 COLLATE "C"))
           AND ($7::text IS NULL OR kind = $7)
+          AND ($8::timestamptz IS NULL OR created_at >= $8)
+          AND ($9::timestamptz IS NULL OR created_at < $9)
         ORDER BY created_at DESC, id DESC
         LIMIT $4 OFFSET $5
       `,
       [
         input.projectId, input.teamId, input.serverSessionId ?? null,
         input.limit ?? 100, input.offset ?? 0, input.folder ?? null, input.kind ?? null,
+        input.createdAfter ?? null, input.createdBefore ?? null,
       ]
     );
     return result.rows.map(mapObservationRow);
@@ -208,7 +213,14 @@ export class PostgresObservationRepository {
           AND server_sessions.team_id = observations.team_id
         WHERE observations.project_id = $1
           AND observations.team_id = $2
-          AND ($3::text IS NULL OR observations.content_search @@ websearch_to_tsquery('english', $3))
+          AND (
+            $3::text IS NULL
+            OR observations.content_search @@ websearch_to_tsquery('english', $3)
+            -- The english parser keeps registries.yaml or src/a/b.ts as one
+            -- file token, so a search for "registries" misses it. A plain
+            -- substring match catches those; such rows rank after FTS hits.
+            OR position(lower($3) in lower(observations.content)) > 0
+          )
           AND (
             $6::text[] IS NULL
             OR lower((observations.metadata->>'project') COLLATE "C") = ANY(

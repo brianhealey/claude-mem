@@ -558,6 +558,7 @@ export async function runServerApiKeyCli(argv: string[]): Promise<void> {
         projectId,
         scopes,
         actorId: 'system:server-cli',
+        label: options.name ?? null,
       });
       console.log(JSON.stringify({
         id: created.id,

@@ -267,6 +267,10 @@ CREATE TABLE IF NOT EXISTS observation_generation_job_events (
 
 CREATE INDEX IF NOT EXISTS idx_agent_events_project_session ON agent_events(project_id, server_session_id, occurred_at);
 ALTER TABLE server_sessions ADD COLUMN IF NOT EXISTS idempotency_key TEXT;
+-- A human-readable name for a key, and when it last authenticated a request
+-- (written at most once a minute per key; see verifyPostgresApiKey).
+ALTER TABLE api_keys ADD COLUMN IF NOT EXISTS label TEXT;
+ALTER TABLE api_keys ADD COLUMN IF NOT EXISTS last_used_at TIMESTAMPTZ;
 ALTER TABLE server_sessions DROP CONSTRAINT IF EXISTS server_sessions_project_id_external_session_id_key;
 -- #2560 — platform_source on agent_events (consistent with server_sessions and
 -- the plan-09 scoping): which platform produced the event (claude-code,

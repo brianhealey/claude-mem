@@ -145,10 +145,11 @@ exactly what that key can reach and nothing more.
 
 | Tab | What it does | Scope needed |
 |-----|--------------|--------------|
-| **Memories** | Browse recent observations, full-text search, filter by folder, kind or session, read one in full, delete one. | `memories:read` (delete needs `memories:write`) |
+| **Memories** | Browse recent observations (new ones appear as they are generated), search with matches highlighted, filter by folder, kind, session or date, read one in full, export as JSON or Markdown. Write, edit or delete one. | `memories:read` (write, edit and delete need `memories:write`) |
 | **Sessions** | List sessions; open one to see its summary and a timeline of captured events, each with the memories generated from it and its raw payload on request. | `memories:read` |
 | **Pipeline** | Job counts by status, the provider and model last used, median capture-to-memory time, token and memory usage, per-lane queue depth, failed jobs grouped by reason, retry one or all. | `memories:read` (retry needs `memories:write`) |
-| **Keys** | List the team's keys, create a read-only or read-and-write key, revoke a key. | `memories:write` |
+| **Keys** | List the team's keys with their label and when each was last used, create a read-only or read-and-write key, revoke a key. | `memories:write` |
+| **Audit** | The team's audit trail: reads and searches, memories written, edited and deleted, keys created and revoked, jobs retried. | `memories:write` |
 
 <Note>
 The key is kept in the browser tab's session storage, or in local storage if you
@@ -159,7 +160,12 @@ network is not trusted: the key is sent as a bearer header on every request.
 The usage figures on the Pipeline tab come from `usage_events`, which the
 generation worker only writes when it runs with `CLAUDE_MEM_USAGE_METERING=1`.
 
-`POST /v1/keys` still mints a read-only key by default. Pass
+`/v1/search` matches on the full-text index and also on a plain substring, so a
+word inside a file name such as `registries.yaml` is found; substring-only
+matches rank after full-text hits.
+
+`POST /v1/keys` still mints a read-only key by default, and takes an optional
+`label`. Pass
 `{ "scopes": ["memories:read", "memories:write"] }` to mint one that can also
 capture. `DELETE /v1/keys/:id` revokes a key; a key cannot revoke itself.
 
@@ -285,7 +291,9 @@ POST   /v1/events                 # ?generate= ?wait=
 POST   /v1/events/batch
 GET    /v1/events/:id
 POST   /v1/memories
-GET    /v1/memories?projectId=    # page through observations (limit, offset, serverSessionId, folder, kind)
+GET    /v1/memories?projectId=    # page through observations (limit, offset, serverSessionId, folder, kind, createdAfter, createdBefore)
+GET    /v1/memories/head          # count and newest timestamp, for polling
+PATCH  /v1/memories/:id           # edit an observation's content or kind
 DELETE /v1/memories/:id           # forget one observation
 POST   /v1/search
 POST   /v1/context
@@ -297,6 +305,7 @@ POST   /v1/jobs/retry-failed      # requeue all failed jobs, optionally for one 
 POST   /v1/keys                   # mint a key (write scope); read-only by default
 GET    /v1/keys                   # list the team's keys, metadata only (write scope)
 DELETE /v1/keys/:id               # revoke a key (write scope)
+GET    /v1/audit                  # the team's audit trail (write scope; limit, offset, action)
 GET    /v1/connect                # connect command with key placeholder
 GET    /v1/usage                  # usage totals for this month and today
 DELETE /v1/projects/:projectId/memory   # purge a whole project
