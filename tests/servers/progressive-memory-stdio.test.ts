@@ -181,9 +181,14 @@ describe('built local MCP progressive stdio integration', () => {
           expect(modelText(supported)).toContain('Selected server context.');
         }
       }
-      const unavailable = await client.callTool({ name: 'mem_search', arguments: { query: 'decision' } }) as CallToolResult;
-      expect(unavailable.isError).toBe(true);
-      expect(modelText(unavailable)).toContain('hosted claude-mem MCP');
+      const index = await client.callTool({ name: 'mem_search', arguments: { query: 'decision' } }) as CallToolResult;
+      expect(index.isError).not.toBe(true);
+      expect(modelText(index)).toContain('A server decision');
+      expect(modelText(index)).not.toContain('PRIVATE_');
+      const recalled = await client.callTool({ name: 'mem_search', arguments: { query: 'staging deployment', mode: 'auto' } }) as CallToolResult;
+      expect(recalled.isError).not.toBe(true);
+      expect(modelText(recalled)).toContain('Use staging for deployment rehearsals.');
+      expect(modelText(recalled)).not.toContain('PRIVATE_NOTE_METADATA');
       const note = await client.callTool({ name: 'save_memory', arguments: { text: 'A server-scoped note.' } }) as CallToolResult;
       expect(note.isError).toBe(true);
       expect(modelText(note)).toContain('observation_add');

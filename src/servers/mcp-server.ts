@@ -44,7 +44,17 @@ import { getProjectContext, type ProjectContext } from '../utils/project-name.js
 import { withCheckoutProjects } from './checkout-search-scope.js';
 import { postCorpusRequestOverSse } from './corpus-worker-stream.js';
 import { withWorkerRestartOnRefusedConnection } from './worker-restart.js';
-import { ProgressiveSearchError, progressiveSearchToolError } from '../shared/progressive-search.js';
+import { randomBytes } from 'node:crypto';
+import {
+  MemoryProgressiveCursorStore,
+  ProgressiveSearch,
+  ProgressiveSearchError,
+  progressiveSearchToolError,
+  progressiveSearchToolResult,
+  projectMemoryContent,
+  type MemoryIndexRow,
+  type ProgressiveSearchInput,
+} from '../shared/progressive-search.js';
 import { formatMcpPayload, formatWorkerMcpResponse, mcpTextResult, workerFailureText, serverFailureText, type McpTextPurpose } from './mcp-text-format.js';
 
 /** This server's checkout (Claude Code starts it in the workspace), resolved once. */
@@ -444,6 +454,58 @@ const handleObservationGenerationStatus = wrapHandler('observation_generation_st
   return formatMcpPayload('job', response);
 });
 
+// The server has no timeline or fetch-by-id route, so server-runtime mem_search
+// keeps the bodies /v1/search already returned and serves steps 2 and 3 from
+// them. Continuations live in this process too, so both expire together.
+const SERVER_SEARCH_BODY_LIMIT = 500;
+const serverSearchSecret = randomBytes(32);
+const serverSearchCursors = new MemoryProgressiveCursorStore();
+const serverSearchBodies = new Map<string, string>();
+
+function serverSearchTitle(content: string, metadata: unknown): string {
+  const data = metadata && typeof metadata === 'object' ? metadata as Record<string, unknown> : {};
+  for (const candidate of [data.title, data.request]) {
+    if (typeof candidate === 'string' && candidate.trim()) return candidate.trim();
+  }
+  return content.split('\n', 1)[0].trim();
+}
+
+async function serverMemSearch(ctx: ServerAvailable, input: ProgressiveSearchInput) {
+  const project = ctx.projectId;
+  const bodyKey = (id: string) => `${project}\0${id}`;
+  return new ProgressiveSearch({
+    search: async ({ query, limit }) => {
+      const response = await ctx.client.searchObservations({ projectId: project, query, limit });
+      return response.observations.map((observation): MemoryIndexRow => {
+        const id = String(observation.id);
+        const content = typeof observation.content === 'string' ? observation.content : '';
+        serverSearchBodies.delete(bodyKey(id));
+        serverSearchBodies.set(bodyKey(id), content);
+        return {
+          id, kind: 'observation', project,
+          title: serverSearchTitle(content, observation.metadata),
+          createdAt: typeof observation.createdAtEpoch === 'number' ? observation.createdAtEpoch : null,
+          type: typeof observation.kind === 'string' ? observation.kind : null,
+        };
+      });
+    },
+    timeline: async ({ anchor }) => [anchor],
+    fetch: async refs => refs.flatMap(ref => {
+      const content = serverSearchBodies.get(bodyKey(ref.id));
+      if (content === undefined) return [];
+      const projected = projectMemoryContent(content);
+      return [{ ...ref, content: projected.text, truncated: projected.truncated }];
+    }),
+  }, { secret: serverSearchSecret, scope: `server/${project}`, cursorStore: serverSearchCursors })
+    .run(input)
+    .finally(() => {
+      for (const key of serverSearchBodies.keys()) {
+        if (serverSearchBodies.size <= SERVER_SEARCH_BODY_LIMIT) break;
+        serverSearchBodies.delete(key);
+      }
+    });
+}
+
 async function ensureWorkerConnection(): Promise<boolean> {
   if (await verifyWorkerConnection()) {
     return true;
@@ -503,8 +565,10 @@ const tools = [
     annotations: READ_ONLY_TOOL_ANNOTATIONS,
     handler: async (args: any) => {
       try {
-        if (selectRuntime() === 'server') {
-          throw new ProgressiveSearchError('unsupported_runtime', 'Use the hosted claude-mem MCP connection for server memory, or select worker runtime for local mem_search.');
+        const server = resolveServerToolContext();
+        if (server) {
+          if (!server.available) throw new ProgressiveSearchError('unsupported_runtime', `mem_search: ${server.reason}.`);
+          return progressiveSearchToolResult(await serverMemSearch(server, args ?? {}));
         }
         const checkout = currentCheckout();
         const body = { ...withCheckoutProjects(args ?? {}, checkout), searchScope: checkout.allProjects.join(',') };
