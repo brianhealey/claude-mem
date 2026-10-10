@@ -25,6 +25,10 @@ export const SERVER_POSTGRES_TABLES = [
   'rate_limit_counters'
 ] as const;
 
+// Arbitrary, fixed key for pg_advisory_xact_lock: every bootstrapper must use
+// the same one.
+const SCHEMA_BOOTSTRAP_ADVISORY_LOCK = 4_271_001;
+
 export async function bootstrapServerPostgresSchema(client: PostgresQueryable): Promise<void> {
   if (isPostgresPool(client)) {
     const poolClient = await client.connect();
@@ -38,6 +42,11 @@ export async function bootstrapServerPostgresSchema(client: PostgresQueryable): 
 
   await client.query('BEGIN');
   try {
+    // The server and its generation worker start together and both bootstrap.
+    // The DDL takes table locks in an order two concurrent runs can interleave,
+    // which Postgres reports as "deadlock detected" and one process dies on
+    // boot. Released with the transaction.
+    await client.query('SELECT pg_advisory_xact_lock($1)', [SCHEMA_BOOTSTRAP_ADVISORY_LOCK]);
     await applyPhase1Migration(client);
     await client.query('COMMIT');
   } catch (error) {
