@@ -151,6 +151,14 @@ exactly what that key can reach and nothing more.
 | **Keys** | List the team's keys with their label and when each was last used, create a read-only or read-and-write key, revoke a key. | `memories:write` |
 | **Audit** | The team's audit trail: reads and searches, memories written, edited and deleted, keys created and revoked, jobs retried. | `memories:write` |
 
+<Warning>
+Set `CLAUDE_MEM_PUBLIC_URL` (or `CLAUDE_MEM_ALLOWED_ORIGINS`) to the address
+people open the dashboard at. The server refuses browser requests from any
+origin it has not been told about, so without it the page loads but every
+search, save, delete and retry fails with `CORS not allowed`. Naming the server
+this way also makes it refuse requests whose `Host` is some other DNS name.
+</Warning>
+
 <Note>
 The key is kept in the browser tab's session storage, or in local storage if you
 tick **Remember on this device**. Serve the dashboard over HTTPS anywhere the

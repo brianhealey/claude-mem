@@ -8,6 +8,7 @@ import { dirname } from 'path';
 import { fileURLToPath } from 'url';
 import { parseArgs } from 'util';
 import { Server, type RouteHandler } from '../../services/server/Server.js';
+import { buildWorkerOriginPolicy, type WorkerOriginPolicy } from '../../services/worker/http/middleware.js';
 import { paths } from '../../shared/paths.js';
 import { logger } from '../../utils/logger.js';
 import {
@@ -55,6 +56,30 @@ export interface ServerRuntimeState {
     queueManager: ReturnType<ServerServiceGraph['queueManager']['getHealth']>;
     generationWorkerManager: ReturnType<ServerServiceGraph['generationWorkerManager']['getHealth']>;
   };
+}
+
+/**
+ * Which browser origins may call this server. Without a policy the CORS
+ * middleware admits only pages on localhost, so the dashboard served from the
+ * server's own public name could load but every request carrying an Origin
+ * (search, save, delete, retry, minting a key) was refused as "CORS not
+ * allowed".
+ *
+ * A policy also turns on the Host check, which refuses any DNS name the
+ * operator has not named. So one is built only when the operator has named the
+ * server, through CLAUDE_MEM_PUBLIC_URL or CLAUDE_MEM_ALLOWED_ORIGINS; a
+ * deployment that sets neither keeps accepting whatever Host reaches it.
+ * Read from the environment only, like the rest of the server's config.
+ */
+export function serverOriginPolicyFromEnv(env: NodeJS.ProcessEnv = process.env): WorkerOriginPolicy | undefined {
+  const publicUrl = (env.CLAUDE_MEM_PUBLIC_URL ?? '').trim();
+  const allowedOrigins = (env.CLAUDE_MEM_ALLOWED_ORIGINS ?? '').trim();
+  if (!publicUrl && !allowedOrigins) return undefined;
+  const policy = buildWorkerOriginPolicy({
+    CLAUDE_MEM_PUBLIC_URL: publicUrl,
+    CLAUDE_MEM_ALLOWED_ORIGINS: allowedOrigins,
+  });
+  return policy.allowedOrigins.length > 0 ? policy : undefined;
 }
 
 class ServerRuntimeInfoRoutes implements RouteHandler {
@@ -130,6 +155,7 @@ export class ServerService {
       // #2572 — server runtime is reachable over the network in Docker, so it
       // emits hardening headers (the worker, loopback-only, does not).
       securityHeaders: true,
+      originPolicy: serverOriginPolicyFromEnv(),
       getInitializationComplete: () => this.graph.postgres.bootstrap.initialized,
       getMcpReady: () => true,
       onShutdown: () => this.stop(),
