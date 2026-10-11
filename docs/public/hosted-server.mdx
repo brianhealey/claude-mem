@@ -195,6 +195,12 @@ out itself: what `/v1/context` returns and records is then exactly what was
 injected, and the Value tab does not count a lookup that only found the
 session's own work as a recall.
 
+A compaction removes the session's earlier work from the agent's context, so
+after one the hook also passes `excludeContentSessionSince`, the time of the
+last compaction. The server then leaves out only the session's memories from
+after that time; those from before it can be injected, and count as recalls,
+like any other memory. A memory is dated by the events it was generated from.
+
 The Value tab's "Handed over, then searched for" counts memories given to an
 agent unasked (at session start or with a prompt) that an agent's own search
 returned afterwards. It is the only sign of use the audit trail holds, and a

@@ -101,6 +101,22 @@ describe('observation search widening', () => {
     expect(recent.map(row => row.content)).not.toContain('Pangolin fact from the asking session');
   });
 
+  it('returns an agent session\'s own rows from before its last compaction', async () => {
+    const sessions = new PostgresServerSessionsRepository(pool);
+    const own = await sessions.create({ projectId, teamId, contentSessionId: 'agent-compacted' });
+    const before = await storage.observations.create({ projectId, teamId, serverSessionId: own.id, content: 'Quokka fact from before the compaction' });
+    await storage.observations.create({ projectId, teamId, serverSessionId: own.id, content: 'Quokka fact from after the compaction' });
+    await pool.query(`UPDATE observations SET created_at = now() - interval '2 hours' WHERE id = $1`, [before.id]);
+    const compactedAt = new Date(Date.now() - 60 * 60 * 1000).toISOString();
+
+    const read = (extra: Record<string, unknown>) => storage.observations
+      .search({ projectId, teamId, query: 'quokka', excludeContentSessionId: 'agent-compacted', ...extra })
+      .then(rows => rows.map(row => row.content));
+
+    expect(await read({})).toEqual([]);
+    expect(await read({ excludeContentSessionSince: compactedAt })).toEqual(['Quokka fact from before the compaction']);
+  });
+
   it('survives query text that is not valid tsquery syntax', async () => {
     expect(await search('what\'s (the) "deal" & with | this:* <-> !')).toEqual([]);
   });

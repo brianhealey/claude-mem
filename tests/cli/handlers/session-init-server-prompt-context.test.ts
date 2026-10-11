@@ -4,6 +4,10 @@ import {
   setSessionInitDependenciesForTesting,
 } from '../../../src/cli/handlers/session-init.js';
 import type { SettingsDefaults } from '../../../src/shared/SettingsDefaultsManager.js';
+import { markCompacted } from '../../../src/shared/session-compaction.js';
+import { mkdtempSync, rmSync } from 'fs';
+import { join } from 'path';
+import { tmpdir } from 'os';
 
 const SESSION_ID = 'session-server-prompt';
 
@@ -103,6 +107,36 @@ describe('sessionInitHandler prompt context in server runtime', () => {
     const empty = useServerRuntime({ semanticInject: true, rows: [] });
     expect((await submitPrompt()).hookSpecificOutput).toBeUndefined();
     expect(empty).toHaveLength(1);
+  });
+
+  it('takes back this session\'s own memories from before its last compaction', async () => {
+    const origDataDir = process.env.CLAUDE_MEM_DATA_DIR;
+    const dataDir = mkdtempSync(join(tmpdir(), 'session-init-compaction-'));
+    process.env.CLAUDE_MEM_DATA_DIR = dataDir;
+    try {
+      markCompacted(SESSION_ID, new Date('2026-10-11T12:00:00.000Z'));
+      const calls = useServerRuntime({
+        semanticInject: true,
+        rows: [
+          { id: 'a', content: 'Before the compaction\nbody', kind: 'discovery', contentSessionId: SESSION_ID, metadata: {}, createdAtEpoch: Date.UTC(2026, 9, 11, 11) },
+          { id: 'b', content: 'After the compaction\nbody', kind: 'discovery', contentSessionId: SESSION_ID, metadata: {}, createdAtEpoch: Date.UTC(2026, 9, 11, 13) },
+        ],
+      });
+
+      const result = await submitPrompt();
+
+      expect(calls[0]!.request).toMatchObject({
+        excludeContentSessionId: SESSION_ID,
+        excludeContentSessionSince: '2026-10-11T12:00:00.000Z',
+      });
+      const context = result.hookSpecificOutput?.additionalContext ?? '';
+      expect(context).toContain('### Before the compaction (2026-10-11)');
+      expect(context).not.toContain('After the compaction');
+    } finally {
+      if (origDataDir === undefined) delete process.env.CLAUDE_MEM_DATA_DIR;
+      else process.env.CLAUDE_MEM_DATA_DIR = origDataDir;
+      rmSync(dataDir, { recursive: true, force: true });
+    }
   });
 
   it('never blocks the prompt when the server cannot answer', async () => {

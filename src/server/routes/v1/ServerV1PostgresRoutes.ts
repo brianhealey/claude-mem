@@ -1727,6 +1727,9 @@ export class ServerV1PostgresRoutes implements RouteHandler {
         // What the caller would throw away anyway. Excluded here, so the rows
         // returned, and recorded in the audit trail, are the rows it uses.
         excludeContentSessionId: z.string().min(1).optional(),
+        // When that session last compacted. Its rows from before then are out
+        // of the agent's context again, so they are not excluded.
+        excludeContentSessionSince: z.iso.datetime({ offset: true }).optional(),
         excludeKinds: z.array(z.string().min(1)).min(1).max(10).optional(),
       }),
       async (req, res, body) => {
@@ -1750,6 +1753,7 @@ export class ServerV1PostgresRoutes implements RouteHandler {
             folderProjects: body.folderProjects ?? null,
             excludeSubagents: body.excludeSubagents === true,
             excludeContentSessionId: body.excludeContentSessionId ?? null,
+            excludeContentSessionSince: body.excludeContentSessionSince ?? null,
             excludeKinds: body.excludeKinds ?? null,
           });
         } catch (error) {

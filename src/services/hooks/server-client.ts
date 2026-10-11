@@ -198,6 +198,9 @@ export interface ServerContextObservationsRequest {
   // Rows the caller would discard, left out by the server so that its record
   // of the read matches what was used.
   excludeContentSessionId?: string;
+  // ISO time of that session's last compaction: its rows from before then are
+  // no longer in the agent's context, so they are returned after all.
+  excludeContentSessionSince?: string;
   excludeKinds?: string[];
 }
 
@@ -305,6 +308,9 @@ export class ServerClient {
     if (input.excludeSubagents !== undefined) payload.excludeSubagents = input.excludeSubagents;
     if (input.purpose !== undefined) payload.purpose = input.purpose;
     if (input.excludeContentSessionId) payload.excludeContentSessionId = input.excludeContentSessionId;
+    if (input.excludeContentSessionId && input.excludeContentSessionSince) {
+      payload.excludeContentSessionSince = input.excludeContentSessionSince;
+    }
     if (input.excludeKinds && input.excludeKinds.length > 0) payload.excludeKinds = input.excludeKinds;
     return this.request<ServerContextObservationsResponse>('POST', '/v1/context', payload, options);
   }

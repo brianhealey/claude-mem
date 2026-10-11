@@ -12,6 +12,7 @@ import {
 } from '../../shared/worker-utils.js';
 import { getProjectContext } from '../../utils/project-name.js';
 import { logger } from '../../utils/logger.js';
+import { readCompactedAt } from '../../shared/session-compaction.js';
 import { HOOK_EXIT_CODES, HOOK_TIMEOUTS } from '../../shared/hook-constants.js';
 import { shouldTrackProject as defaultShouldTrackProject } from '../../shared/should-track-project.js';
 import { loadFromFileOnce as defaultLoadFromFileOnce } from '../../shared/hook-settings.js';
@@ -415,6 +416,8 @@ const SERVER_PROMPT_MEMORY_MAX_CHARS = 700;
 /**
  * Memories relevant to the prompt, from the server store. Rows written by this
  * very session are left out: the agent already has that work in its context.
+ * Once the session has compacted that no longer holds for its earlier work, so
+ * only its rows from after the compaction are left out.
  * Fail-open: any error means no injection, never a blocked prompt.
  */
 async function fetchServerPromptContext(
@@ -429,6 +432,7 @@ async function fetchServerPromptContext(
     timeoutMs: number;
   },
 ): Promise<string> {
+  const compactedAt = readCompactedAt(request.sessionId);
   let rows: Awaited<ReturnType<ServerRuntimeContext['client']['contextObservations']>>['observations'];
   try {
     const result = await runtime.client.contextObservations({
@@ -437,6 +441,7 @@ async function fetchServerPromptContext(
       limit: request.limit,
       // Excluded by the server, so the read it records is what gets injected.
       excludeContentSessionId: request.sessionId,
+      ...(compactedAt ? { excludeContentSessionSince: compactedAt } : {}),
       excludeKinds: ['summary'],
       folderProjects: request.folderProjects,
       excludeSubagents: request.excludeSubagents,
@@ -452,8 +457,12 @@ async function fetchServerPromptContext(
   }
 
   // Filtered again here: a server older than the exclusions ignores them.
+  const compactedAtEpoch = compactedAt ? Date.parse(compactedAt) : null;
+  const alreadyInContext = (row: (typeof rows)[number]): boolean =>
+    row.contentSessionId === request.sessionId
+    && !(compactedAtEpoch !== null && typeof row.createdAtEpoch === 'number' && row.createdAtEpoch < compactedAtEpoch);
   const relevant = rows
-    .filter(row => row.contentSessionId !== request.sessionId && row.kind !== 'summary')
+    .filter(row => !alreadyInContext(row) && row.kind !== 'summary')
     .slice(0, request.limit);
   if (relevant.length === 0) return '';
 

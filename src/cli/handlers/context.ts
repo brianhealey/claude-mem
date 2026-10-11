@@ -19,6 +19,7 @@ import { loadFromFileOnce } from '../../shared/hook-settings.js';
 import { shouldTrackProject } from '../../shared/should-track-project.js';
 import { readStaleMarker } from '../../shared/oauth-token.js';
 import { normalizePlatformSource } from '../../shared/platform-source.js';
+import { markCompacted } from '../../shared/session-compaction.js';
 import { proTrialLine } from '../../shared/pro-promo.js';
 import { MEMORY_PLUGIN_INSTRUCTIONS } from '../../shared/memory-instructions.js';
 import {
@@ -76,6 +77,10 @@ export const contextHandler: EventHandler = {
     // Also guard direct calls from older hook registrations that include resume.
     if (input.platform === 'claude-code' && input.sessionSource === 'resume') {
       return emptyResult;
+    }
+
+    if (input.sessionSource === 'compact' && input.sessionId) {
+      markCompacted(input.sessionId);
     }
 
     const cwd = input.cwd ?? process.cwd();

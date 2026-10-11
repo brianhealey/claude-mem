@@ -85,6 +85,9 @@ export interface ObservationSearchInput {
   // Leave out rows written by this agent session (its own session id, not the
   // server_sessions row id): an agent already has that work in its context.
   excludeContentSessionId?: string | null;
+  // When that session last compacted (ISO time). Rows whose source events all
+  // predate it have left the agent's context, so they are returned.
+  excludeContentSessionSince?: string | null;
   excludeKinds?: string[] | null;
 }
 
@@ -291,6 +294,21 @@ export class PostgresObservationRepository {
             $9::text IS NULL
             OR COALESCE(NULLIF(server_sessions.content_session_id, ''), server_sessions.external_session_id)
               IS DISTINCT FROM $9
+            -- Generation lags the work, so a row is dated by the events it
+            -- was distilled from, and by its own creation only without any.
+            OR COALESCE(
+              (
+                SELECT max(agent_events.occurred_at)
+                FROM observation_sources
+                INNER JOIN agent_events
+                  ON agent_events.id = observation_sources.agent_event_id
+                  AND agent_events.project_id = observations.project_id
+                  AND agent_events.team_id = observations.team_id
+                WHERE observation_sources.observation_id = observations.id
+                  AND observation_sources.source_type = 'agent_event'
+              ),
+              observations.created_at
+            ) < $11::timestamptz
           )
           AND ($10::text[] IS NULL OR observations.kind <> ALL($10::text[]))
           AND (
@@ -347,6 +365,7 @@ export class PostgresObservationRepository {
         relaxed,
         input.excludeContentSessionId || null,
         input.excludeKinds && input.excludeKinds.length > 0 ? input.excludeKinds : null,
+        input.excludeContentSessionSince || null,
       ]
     );
     return result.rows.map(mapObservationRow);
