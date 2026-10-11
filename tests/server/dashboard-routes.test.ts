@@ -400,6 +400,37 @@ describe('dashboard routes', () => {
     expect(bad.status).toBe(400);
   });
 
+  it('GET /v1/value credits a memory listed at session start with its title line, and one handed over with its source', async () => {
+    const event = await storage.agentEvents.create({
+      projectId, teamId, sourceAdapter: 'api', eventType: 'tool_use', occurredAt: new Date(),
+      payload: { out: 'x'.repeat(4000 - '{"out": ""}'.length) },
+    });
+    const title = 'Heron title';
+    const memory = await storage.observations.create({ projectId, teamId, content: `${title}\n${'y'.repeat(400 - title.length - 1)}` });
+    await storage.observationSources.addSource({
+      observationId: memory.id, projectId, teamId, sourceType: 'agent_event', sourceId: event.id, agentEventId: event.id,
+    });
+    const totals = async () => (await (await call('GET', `/v1/value?projectId=${projectId}&days=7`, readKey)).json() as {
+      totals: Record<string, number>;
+    }).totals;
+
+    await call('POST', '/v1/context', readKey, { projectId });
+    expect(await totals()).toMatchObject({
+      recalls: 1,
+      memoriesRecalled: 1,
+      injectedTokens: Math.round(title.length / 4),
+      replacedTokens: Math.round(title.length / 4),
+    });
+
+    await call('POST', '/v1/context', readKey, { projectId, query: 'heron', purpose: 'prompt' });
+    expect(await totals()).toMatchObject({
+      recalls: 2,
+      memoriesRecalled: 1,
+      injectedTokens: Math.round((title.length + 400) / 4),
+      replacedTokens: Math.round((title.length + 4000) / 4),
+    });
+  });
+
   it('GET /v1/value does not count a prompt lookup that only found the asking session\'s own memories', async () => {
     const started = await call('POST', '/v1/sessions/start', writeKey, {
       projectId, externalSessionId: 'agent-asking', contentSessionId: 'agent-asking',

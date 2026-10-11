@@ -168,7 +168,10 @@ network is not trusted: the key is sent as a bearer header on every request.
 
 The Value tab's "rediscovery avoided" is a proxy, not a measurement: it is the
 size of the tool output behind each recalled memory, and assumes the agent would
-otherwise have redone that work. Reads made from the dashboard itself are left
+otherwise have redone that work. A memory that was only listed in a
+session-start block (a `/v1/context` read with no query) is credited with its
+title line on both sides, so it nets to nothing: the agent was shown a line, not
+the memory. Reads made from the dashboard itself are left
 out of it (the page sends `X-Claude-Mem-Client: dashboard`, recorded on its audit
 rows).
 

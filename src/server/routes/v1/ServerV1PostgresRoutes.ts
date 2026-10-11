@@ -484,7 +484,8 @@ export class ServerV1PostgresRoutes implements RouteHandler {
     //               it would have put in the agent's context instead
     // The last two are text length / VALUE_CHARS_PER_TOKEN, and "replaced"
     // assumes the agent would otherwise have redone the work, which nothing
-    // here can check. It is a proxy for value, reported as one.
+    // here can check. It is a proxy for value, reported as one. Memories only
+    // listed in a session-start block are credited with their title line.
     app.get('/v1/value', readAuth, this.asyncHandler(async (req, res) => {
       const teamId = this.requireTeamId(req, res);
       if (!teamId) return;
@@ -503,13 +504,14 @@ export class ServerV1PostgresRoutes implements RouteHandler {
         // A memory's source size is its events' payloads, an event shared by
         // several memories split evenly between them.
         this.options.pool.query<{
-          audit_id: string; recalled_at: Date; observation_id: string; chars: number;
+          audit_id: string; recalled_at: Date; index_only: boolean; observation_id: string; chars: number;
           source_chars: string; observed_at: Date; kind: string; title: string;
         }>(
           `
             WITH recalls AS (
               SELECT audit_log.id AS audit_id, audit_log.created_at AS recalled_at,
-                jsonb_array_elements_text(audit_log.details->'observationIds') AS observation_id
+                jsonb_array_elements_text(audit_log.details->'observationIds') AS observation_id,
+                (audit_log.details->>'mode' = 'context' AND audit_log.details->>'query' IS NULL) AS index_only
               FROM audit_log
               WHERE audit_log.team_id = $1 AND audit_log.project_id = $2
                 AND audit_log.action = 'observation.read'
@@ -518,7 +520,7 @@ export class ServerV1PostgresRoutes implements RouteHandler {
                 AND audit_log.created_at >= $3
                 AND jsonb_typeof(audit_log.details->'observationIds') = 'array'
             )
-            SELECT recalls.audit_id, recalls.recalled_at, observations.id AS observation_id,
+            SELECT recalls.audit_id, recalls.recalled_at, recalls.index_only, observations.id AS observation_id,
               length(observations.content) AS chars, observations.created_at AS observed_at,
               observations.kind, split_part(observations.content, E'\n', 1) AS title,
               COALESCE((
@@ -619,10 +621,14 @@ export class ServerV1PostgresRoutes implements RouteHandler {
       const perMemory = new Map<string, { title: string; kind: string; recalls: number; lastRecalledAtEpoch: number }>();
       const agesMs: number[] = [];
       for (const row of rows) {
-        const chars = Number(row.chars);
+        // A context read with no query is a session-start block, where the
+        // agent is shown a line per memory and not the memory. Listing a title
+        // saves no rediscovery, so it is counted at that line's size on both
+        // sides and nets to nothing.
+        const chars = row.index_only ? row.title.length : Number(row.chars);
         // A memory never stands in for less than its own text: one written by
         // hand, or a summary, has no source events to measure.
-        const replaced = Math.max(Number(row.source_chars), chars);
+        const replaced = row.index_only ? chars : Math.max(Number(row.source_chars), chars);
         const recalledAt = new Date(row.recalled_at).getTime();
         const bucket = daily.get(dayOf(row.recalled_at));
         if (bucket) {
