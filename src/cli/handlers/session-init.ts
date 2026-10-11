@@ -434,8 +434,10 @@ async function fetchServerPromptContext(
     const result = await runtime.client.contextObservations({
       projectId: runtime.projectId,
       query: request.prompt.slice(0, SERVER_PROMPT_QUERY_MAX_CHARS),
-      // Over-read, since this session's own rows are dropped below.
-      limit: request.limit * 2,
+      limit: request.limit,
+      // Excluded by the server, so the read it records is what gets injected.
+      excludeContentSessionId: request.sessionId,
+      excludeKinds: ['summary'],
       folderProjects: request.folderProjects,
       excludeSubagents: request.excludeSubagents,
       platformSource: request.platformSource,
@@ -449,6 +451,7 @@ async function fetchServerPromptContext(
     return '';
   }
 
+  // Filtered again here: a server older than the exclusions ignores them.
   const relevant = rows
     .filter(row => row.contentSessionId !== request.sessionId && row.kind !== 'summary')
     .slice(0, request.limit);

@@ -195,6 +195,10 @@ export interface ServerContextObservationsRequest {
   // 'prompt' marks memory injected alongside a user prompt, which the server
   // counts apart from session-start reads.
   purpose?: 'prompt';
+  // Rows the caller would discard, left out by the server so that its record
+  // of the read matches what was used.
+  excludeContentSessionId?: string;
+  excludeKinds?: string[];
 }
 
 export interface ServerContextObservationsResponse {
@@ -300,6 +304,8 @@ export class ServerClient {
     }
     if (input.excludeSubagents !== undefined) payload.excludeSubagents = input.excludeSubagents;
     if (input.purpose !== undefined) payload.purpose = input.purpose;
+    if (input.excludeContentSessionId) payload.excludeContentSessionId = input.excludeContentSessionId;
+    if (input.excludeKinds && input.excludeKinds.length > 0) payload.excludeKinds = input.excludeKinds;
     return this.request<ServerContextObservationsResponse>('POST', '/v1/context', payload, options);
   }
 

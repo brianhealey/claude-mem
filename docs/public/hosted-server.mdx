@@ -186,7 +186,11 @@ With `CLAUDE_MEM_SEMANTIC_INJECT=true` in the client's settings, the prompt hook
 asks `/v1/context` for memories matching each prompt (up to
 `CLAUDE_MEM_SEMANTIC_INJECT_LIMIT`, default 5) and injects them, leaving out
 memories the current session wrote itself. These reads are marked
-`purpose: "prompt"` in the audit trail.
+`purpose: "prompt"` in the audit trail. The hook passes
+`excludeContentSessionId` and `excludeKinds` so the server leaves those rows
+out itself: what `/v1/context` returns and records is then exactly what was
+injected, and the Value tab does not count a lookup that only found the
+session's own work as a recall.
 
 The Value tab's "Handed over, then searched for" counts memories given to an
 agent unasked (at session start or with a prompt) that an agent's own search

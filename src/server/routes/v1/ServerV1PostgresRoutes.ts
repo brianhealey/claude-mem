@@ -1718,6 +1718,10 @@ export class ServerV1PostgresRoutes implements RouteHandler {
         // Set by the prompt hook, so /v1/value can tell memory injected with a
         // prompt from a session-start read or an agent's own lookup.
         purpose: z.enum(['prompt']).optional(),
+        // What the caller would throw away anyway. Excluded here, so the rows
+        // returned, and recorded in the audit trail, are the rows it uses.
+        excludeContentSessionId: z.string().min(1).optional(),
+        excludeKinds: z.array(z.string().min(1)).min(1).max(10).optional(),
       }),
       async (req, res, body) => {
         const teamId = this.requireTeamId(req, res);
@@ -1739,6 +1743,8 @@ export class ServerV1PostgresRoutes implements RouteHandler {
             platformSource,
             folderProjects: body.folderProjects ?? null,
             excludeSubagents: body.excludeSubagents === true,
+            excludeContentSessionId: body.excludeContentSessionId ?? null,
+            excludeKinds: body.excludeKinds ?? null,
           });
         } catch (error) {
           const err = error instanceof Error ? error : new Error(String(error));

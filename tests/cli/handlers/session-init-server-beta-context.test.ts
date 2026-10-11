@@ -168,7 +168,7 @@ describe('sessionInitHandler server semantic injection', () => {
       }
       if (serverCalls.contextObservations.length !== 1) throw new Error('contextObservations count mismatch: ' + serverCalls.contextObservations.length);
       const lookup = serverCalls.contextObservations[0];
-      if (lookup.projectId !== 'server-project-1' || lookup.query !== ${JSON.stringify(prompt)} || lookup.limit !== 14 || lookup.platformSource !== 'cursor' || lookup.purpose !== 'prompt') {
+      if (lookup.projectId !== 'server-project-1' || lookup.query !== ${JSON.stringify(prompt)} || lookup.limit !== 7 || lookup.platformSource !== 'cursor' || lookup.purpose !== 'prompt') {
         throw new Error('contextObservations body mismatch: ' + JSON.stringify(lookup));
       }
       if (!result.continue || !result.suppressOutput || result.hookSpecificOutput) throw new Error('unexpected result ' + JSON.stringify(result));

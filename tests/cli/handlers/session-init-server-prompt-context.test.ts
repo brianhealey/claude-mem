@@ -52,7 +52,7 @@ describe('sessionInitHandler prompt context in server runtime', () => {
     setSessionInitDependenciesForTesting();
   });
 
-  it('injects memories matched to the prompt, leaving out this session\'s own and summaries', async () => {
+  it('injects memories matched to the prompt, asking the server to leave out this session\'s own and summaries', async () => {
     const calls = useServerRuntime({
       semanticInject: true,
       rows: [
@@ -74,7 +74,9 @@ describe('sessionInitHandler prompt context in server runtime', () => {
     expect(calls[0]!.request).toMatchObject({
       projectId: 'project-1',
       query: 'why does the value tab report a net negative benefit?',
-      limit: 4,
+      limit: 2,
+      excludeContentSessionId: SESSION_ID,
+      excludeKinds: ['summary'],
       excludeSubagents: true,
       platformSource: 'claude',
       purpose: 'prompt',

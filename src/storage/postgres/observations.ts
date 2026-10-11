@@ -82,6 +82,10 @@ export interface ObservationSearchInput {
   platformSource?: string | null;
   folderProjects?: string[] | null;
   excludeSubagents?: boolean;
+  // Leave out rows written by this agent session (its own session id, not the
+  // server_sessions row id): an agent already has that work in its context.
+  excludeContentSessionId?: string | null;
+  excludeKinds?: string[] | null;
 }
 
 export class PostgresObservationRepository {
@@ -284,6 +288,12 @@ export class PostgresObservationRepository {
             )
           )
           AND (
+            $9::text IS NULL
+            OR COALESCE(NULLIF(server_sessions.content_session_id, ''), server_sessions.external_session_id)
+              IS DISTINCT FROM $9
+          )
+          AND ($10::text[] IS NULL OR observations.kind <> ALL($10::text[]))
+          AND (
             NOT $7::boolean
             OR NOT EXISTS (
               SELECT 1
@@ -335,6 +345,8 @@ export class PostgresObservationRepository {
         folderProjects,
         input.excludeSubagents === true,
         relaxed,
+        input.excludeContentSessionId || null,
+        input.excludeKinds && input.excludeKinds.length > 0 ? input.excludeKinds : null,
       ]
     );
     return result.rows.map(mapObservationRow);

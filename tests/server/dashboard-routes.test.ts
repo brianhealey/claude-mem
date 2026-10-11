@@ -400,6 +400,31 @@ describe('dashboard routes', () => {
     expect(bad.status).toBe(400);
   });
 
+  it('GET /v1/value does not count a prompt lookup that only found the asking session\'s own memories', async () => {
+    const started = await call('POST', '/v1/sessions/start', writeKey, {
+      projectId, externalSessionId: 'agent-asking', contentSessionId: 'agent-asking',
+    });
+    const serverSessionId = (await started.json() as { session: { id: string } }).session.id;
+    await storage.observations.create({ projectId, teamId, serverSessionId, content: 'Narwhal migration notes' });
+
+    const lookup = await call('POST', '/v1/context', readKey, {
+      projectId, query: 'narwhal', purpose: 'prompt', excludeContentSessionId: 'agent-asking', excludeKinds: ['summary'],
+    });
+    expect(lookup.status).toBe(200);
+    expect((await lookup.json() as { observations: unknown[] }).observations).toEqual([]);
+
+    const body = await (await call('GET', `/v1/value?projectId=${projectId}&days=7`, readKey)).json() as { totals: Record<string, number> };
+    expect(body.totals).toMatchObject({
+      recalls: 0,
+      memoriesRecalled: 0,
+      injectedTokens: 0,
+      replacedTokens: 0,
+      promptReads: 1,
+      emptyPromptReads: 1,
+      memoriesHandedUnasked: 0,
+    });
+  });
+
   it('GET /v1/value weighs generation and injection against what recall replaced', async () => {
     // A 4,000-character tool output distilled into a 400-character memory.
     const event = await storage.agentEvents.create({

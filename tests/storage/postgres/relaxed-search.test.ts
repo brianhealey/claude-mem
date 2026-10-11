@@ -7,6 +7,7 @@ import {
   createPostgresStorageRepositories,
   type PostgresStorageRepositories,
 } from '../../../src/storage/postgres/index.js';
+import { PostgresServerSessionsRepository } from '../../../src/storage/postgres/server-sessions.js';
 import { createIsolatedSchema, dropSchema, poolForSchema } from '../../sdk/pg-isolation.js';
 
 const testDatabaseUrl = process.env.CLAUDE_MEM_TEST_POSTGRES_URL;
@@ -75,6 +76,29 @@ describe('observation search widening', () => {
   it('leaves single-term and well-matched searches alone', async () => {
     expect(await search('docker')).toEqual(['Docker Desktop started and daemon verified']);
     expect(await search('nonexistentterm')).toEqual([]);
+  });
+
+  it('leaves out an agent session\'s own rows and the excluded kinds', async () => {
+    const sessions = new PostgresServerSessionsRepository(pool);
+    const own = await sessions.create({ projectId, teamId, contentSessionId: 'agent-own' });
+    const other = await sessions.create({ projectId, teamId, contentSessionId: 'agent-other' });
+    await storage.observations.create({ projectId, teamId, serverSessionId: own.id, content: 'Pangolin fact from the asking session' });
+    await storage.observations.create({ projectId, teamId, serverSessionId: other.id, content: 'Pangolin fact from another session' });
+    await storage.observations.create({ projectId, teamId, serverSessionId: other.id, kind: 'summary', content: 'Pangolin session summary' });
+    await storage.observations.create({ projectId, teamId, content: 'Pangolin fact with no session' });
+
+    const read = (extra: Record<string, unknown>) => storage.observations
+      .search({ projectId, teamId, query: 'pangolin', ...extra })
+      .then(rows => rows.map(row => row.content).sort());
+
+    expect(await read({})).toHaveLength(4);
+    expect(await read({ excludeContentSessionId: 'agent-own', excludeKinds: ['summary'] })).toEqual([
+      'Pangolin fact from another session',
+      'Pangolin fact with no session',
+    ]);
+    // A recency read (no query) applies the same exclusions.
+    const recent = await storage.observations.search({ projectId, teamId, excludeContentSessionId: 'agent-own', limit: 50 });
+    expect(recent.map(row => row.content)).not.toContain('Pangolin fact from the asking session');
   });
 
   it('survives query text that is not valid tsquery syntax', async () => {
