@@ -12,11 +12,12 @@ import { shouldTrackProject } from '../../shared/should-track-project.js';
 import { loadFromFileOnce } from '../../shared/hook-settings.js';
 import { getProjectContext } from '../../utils/project-name.js';
 import { detectLanguage } from '../../services/smart-file-read/language-map.js';
-import { isTreeSitterCliAvailable } from '../../services/smart-file-read/tree-sitter-bin-path.js';
+import { checkTreeSitterCliLoadable } from '../../services/smart-file-read/tree-sitter-bin-path.js';
 import { resolveWithinWorkspace } from '../../services/smart-file-read/workspace-path.js';
 import { claimFileContextInjection } from './file-context-dedupe.js';
 import { memorySearchHandler } from './memory-search.js';
 import { isQwenCodeHookEvent } from './session-init.js';
+import { resolveRuntimeContext } from '../../services/hooks/runtime-selector.js';
 
 /** Below this a file gets neither the timeline nor a deny: reading it costs about what the timeline would. */
 const FILE_CONTEXT_MIN_BYTES = 1_500;
@@ -308,6 +309,8 @@ export function shouldDenyFullFileRead(
   // An install whose tree-sitter-cli never downloaded its binary answers
   // "Could not parse" to every smart_outline call, so routing Claude there
   // would strand it; the Read goes through with the timeline as context.
+  // The same holds for a present-but-unloadable binary (#4758): the file
+  // exists, but the smart tools cannot parse with it.
   return isSmartReadAvailable();
 }
 
@@ -340,6 +343,14 @@ export const fileContextHandler: EventHandler = {
       return { continue: true, suppressOutput: true };
     }
 
+    // #4558 — the by-file lookup is a worker-only route, and calling it lazy-spawns
+    // a local worker (and creates its DB). In server runtime there is no local
+    // worker by design, so skip file context like summarize/session-end do.
+    if (resolveRuntimeContext().runtime === 'server') {
+      logger.debug('HOOK', 'Server runtime: skipping worker file-context lookup', { cwd: input.cwd });
+      return { continue: true, suppressOutput: true };
+    }
+
     const lookupResults = await Promise.allSettled(
       candidatePaths.map(candidatePath => lookupFileObservationHistory(input, candidatePath))
     );
@@ -368,7 +379,10 @@ export const fileContextHandler: EventHandler = {
         fileReadGateSetting,
         fileIsInsideWorkspace,
         fileHasMoreLinesThan,
-        isTreeSitterCliAvailable,
+        // The gate denies only where the smart tools can actually parse: a
+        // present-but-unloadable tree-sitter CLI (#4758) must not route Reads
+        // to smart_outline.
+        () => checkTreeSitterCliLoadable().loadable,
       )) {
         // Record the claim so a targeted Read that follows this denial does not
         // re-inject the timeline it already carried. The result is ignored on

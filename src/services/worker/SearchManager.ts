@@ -45,12 +45,20 @@ export class SearchManager {
     private sessionStore: SessionStore,
     private chromaSync: ChromaSync | null,
     private formatter: FormattingService,
-    private timelineService: TimelineService
+    private timelineService: TimelineService,
+    /**
+     * Implicit window, in milliseconds, that date-less semantic searches
+     * apply (CLAUDE_MEM_SEARCH_RECENCY_DAYS). Defaults to the shipped 90
+     * days; 0 disables the window so every semantic match stays eligible.
+     * An explicit `dateRange` on a request always wins over it.
+     */
+    private searchRecencyWindowMs: number = SEARCH_CONSTANTS.RECENCY_WINDOW_MS
   ) {
     this.orchestrator = new SearchOrchestrator(
       sessionSearch,
       sessionStore,
-      chromaSync
+      chromaSync,
+      searchRecencyWindowMs
     );
   }
 
@@ -118,7 +126,7 @@ export class SearchManager {
     const whereFilter = this.buildDocTypeWhereFilter(docType, readKeys, platformSource);
     const startEpoch = dateRange
       ? dateRange.start != null ? resolveDateBound(dateRange.start, 'start') : undefined
-      : Date.now() - SEARCH_CONSTANTS.RECENCY_WINDOW_MS;
+      : this.searchRecencyWindowMs > 0 ? Date.now() - this.searchRecencyWindowMs : undefined;
     const endEpoch = dateRange?.end != null ? resolveDateBound(dateRange.end, 'end') : undefined;
     let candidateLimit: number = SEARCH_CONSTANTS.CHROMA_BATCH_SIZE;
     // Five ranked windows (100..1600), at most ten Chroma transport calls.
@@ -427,8 +435,8 @@ export class SearchManager {
         if (dateRange.end) {
           endEpoch = resolveDateBound(dateRange.end, 'end');
         }
-      } else {
-        startEpoch = Date.now() - SEARCH_CONSTANTS.RECENCY_WINDOW_MS;
+      } else if (this.searchRecencyWindowMs > 0) {
+        startEpoch = Date.now() - this.searchRecencyWindowMs;
       }
 
       const recentMetadata = chromaResults.metadatas.map((meta, idx) => ({
@@ -439,7 +447,12 @@ export class SearchManager {
           && (!endEpoch || meta.created_at_epoch <= endEpoch)
       })).filter(item => item.isRecent);
 
-      logger.debug('SEARCH', dateRange ? 'Results within user date range' : 'Results within 90-day window', { count: recentMetadata.length });
+      const windowLabel = dateRange
+        ? 'Results within user date range'
+        : this.searchRecencyWindowMs > 0
+          ? `Results within ${this.searchRecencyWindowMs / 86_400_000}-day window`
+          : 'Results across full history (recency window disabled)';
+      logger.debug('SEARCH', windowLabel, { count: recentMetadata.length });
 
       const obsIds: number[] = [];
       const sessionIds: number[] = [];
@@ -501,8 +514,10 @@ export class SearchManager {
     scope: { searchObservations: boolean; searchSessions: boolean; searchPrompts: boolean }
   ): SearchResults {
     const limit = options.limit || SEARCH_CONSTANTS.DEFAULT_LIMIT;
-    const byDate = (a: { created_at_epoch: number }, b: { created_at_epoch: number }) =>
-      dateOrder === 'date_desc' ? b.created_at_epoch - a.created_at_epoch : a.created_at_epoch - b.created_at_epoch;
+    const byDate = (a: { id: number; created_at_epoch: number }, b: { id: number; created_at_epoch: number }) =>
+      dateOrder === 'date_desc'
+        ? b.created_at_epoch - a.created_at_epoch || b.id - a.id
+        : a.created_at_epoch - b.created_at_epoch || a.id - b.id;
     const mergeByDate = <T extends { id: number; created_at_epoch: number }>(chromaRows: T[], keywordRows: T[]): T[] => {
       const rowsById = new Map<number, T>();
       for (const row of [...chromaRows, ...keywordRows]) {
@@ -602,14 +617,22 @@ export class SearchManager {
           ? whereFilters[0]
           : { $and: whereFilters };
 
+      // HTTP pagination values can be strings. Keep enough filtered rows to
+      // reach the page, and apply the offset only after supplementation/union.
+      const offset = Number(options.offset || 0);
+      const dateOrdered = options.orderBy === 'date_desc' || options.orderBy === 'date_asc';
+      const limit = options.limit ? Number(options.limit) : (dateOrdered ? SEARCH_CONSTANTS.DEFAULT_LIMIT : undefined);
+      const candidateOptions = { ...options, offset: 0, limit: limit === undefined ? undefined : offset + limit };
+
       try {
-        const chromaResults = await this.performChromaSemanticSearch(query, whereFilter, options, { obs_type: effectiveObsType, concepts, files, searchObservations, searchSessions, searchPrompts });
+        const chromaResults = await this.performChromaSemanticSearch(query, whereFilter, candidateOptions, { obs_type: effectiveObsType, concepts, files, searchObservations, searchSessions, searchPrompts });
         chromaSucceeded = true;
         // Same fallback policy as the orchestrator pipeline: SQLite refills every requested
         // category Chroma left empty, or answers alone when Chroma left them all empty.
         const supplemented = await this.orchestrator.supplementEmptyCategories(
           {
-            ...options,
+            ...candidateOptions,
+            limit: candidateOptions.limit ?? offset + SEARCH_CONSTANTS.DEFAULT_LIMIT,
             query,
             searchType: category ?? 'all',
             obsType: effectiveObsType,
@@ -653,10 +676,17 @@ export class SearchManager {
           query,
           options.orderBy,
           { observations, sessions, prompts },
-          { ...options, type: effectiveObsType, concepts, files },
-          options,
+          { ...candidateOptions, type: effectiveObsType, concepts, files },
+          candidateOptions,
           { searchObservations, searchSessions, searchPrompts }
         ));
+      }
+
+      if (!chromaFailed) {
+        const end = limit === undefined ? undefined : offset + limit;
+        observations = observations.slice(offset, end);
+        sessions = sessions.slice(offset, end);
+        prompts = prompts.slice(offset, end);
       }
     }
     // PATH 3: FTS5 KEYWORD SEARCH (Chroma not initialized)

@@ -45,6 +45,25 @@ const RETIRED_OPENROUTER_DEFAULT_MODELS: ReadonlySet<string> = new Set([
   'xiaomi/mimo-v2-flash:free',
 ]);
 
+/**
+ * Every SettingsDefaults key is declared `string`, because that is how every
+ * writer seeds it and how every gate reads it: the Chroma gates test
+ * `CLAUDE_MEM_CHROMA_ENABLED !== 'false'`, not `!== false`. settings.json is
+ * hand-editable JSON, though, so a user who writes `"CLAUDE_MEM_CHROMA_ENABLED":
+ * false` (unquoted) puts the JSON boolean there, which is `!== 'false'` and
+ * leaves chroma running with nothing reporting that the setting was ignored
+ * (#4630).
+ *
+ * Render a JSON boolean as the string the key declares so both spellings mean
+ * the same thing to every consumer. Numbers are deliberately left alone: the
+ * deadline migrations treat a hand-written number as the user choosing it, and
+ * anything else is passed through untouched so this never rewrites a value it
+ * does not understand.
+ */
+function coercePersistedSettingValue(value: unknown): unknown {
+  return typeof value === 'boolean' ? String(value) : value;
+}
+
 function hasRetiredOpenRouterDefault(flatSettings: Record<string, any>): boolean {
   const model = flatSettings.CLAUDE_MEM_OPENROUTER_MODEL;
   if (typeof model !== 'string' || !RETIRED_OPENROUTER_DEFAULT_MODELS.has(model.trim())) {
@@ -155,6 +174,8 @@ export interface SettingsDefaults {
   CLAUDE_MEM_SESSION_START_INCLUDE_ALL_SOURCES: string;
   CLAUDE_MEM_WORKER_PORT: string;
   CLAUDE_MEM_WORKER_HOST: string;
+  CLAUDE_MEM_WORKER_INGEST_TOKEN: string;
+  CLAUDE_MEM_HOOK_SPOOL_TRANSPORT: string;
   CLAUDE_MEM_ALLOWED_ORIGINS: string;
   CLAUDE_MEM_PUBLIC_URL: string;
   CLAUDE_MEM_API_TIMEOUT_MS: string;
@@ -171,6 +192,7 @@ export interface SettingsDefaults {
   CLAUDE_MEM_CODEX_REASONING_EFFORT: string;
   CLAUDE_MEM_CODEX_MAX_CONCURRENT_AGENTS: string;
   CLAUDE_MEM_CODEX_OBSERVATION_BATCH_SIZE: string;
+  CLAUDE_MEM_CLAUDE_OBSERVATION_BATCH_SIZE: string;
   CLAUDE_MEM_CODEX_OBSERVATION_BATCH_MAX_CHARS: string;
   CLAUDE_MEM_CLAUDE_AUTH_METHOD: string;  
   CLAUDE_MEM_GEMINI_API_KEY: string;
@@ -181,6 +203,7 @@ export interface SettingsDefaults {
   CLAUDE_MEM_OPENROUTER_API_KEYS: string;
   CLAUDE_MEM_OPENROUTER_MODEL: string;
   CLAUDE_MEM_OPENROUTER_BASE_URL: string;
+  CLAUDE_MEM_OPENROUTER_TEMPERATURE: string;
   CLAUDE_MEM_OPENROUTER_SITE_URL: string;
   CLAUDE_MEM_OPENROUTER_APP_NAME: string;
   CLAUDE_MEM_OPENROUTER_EXTRA_BODY: string;
@@ -205,6 +228,8 @@ export interface SettingsDefaults {
   CLAUDE_CODE_PATH: string;
   /** #2753 — override the effective CLAUDE_CONFIG_DIR for the keychain lookup + SDK subprocess env only. Empty = fall through to process.env.CLAUDE_CONFIG_DIR / default. Never touches the worker's own MARKETPLACE_ROOT/paths. */
   CLAUDE_MEM_CLAUDE_CONFIG_DIR: string;
+  /** #4689 — transcript-only CLAUDE_CONFIG_DIR for the spawned SDK subprocess (keeps internal session transcripts out of ~/.claude/projects). Credentials stay on the default profile; only honored when CLAUDE_MEM_CLAUDE_CONFIG_DIR is empty. Empty = transcripts follow the credential profile dir. */
+  CLAUDE_MEM_OBSERVER_CLAUDE_CONFIG_DIR: string;
   CLAUDE_MEM_MODE: string;
   CLAUDE_MEM_CONTEXT_SHOW_READ_TOKENS: string;
   CLAUDE_MEM_CONTEXT_SHOW_WORK_TOKENS: string;
@@ -221,6 +246,7 @@ export interface SettingsDefaults {
   CLAUDE_MEM_REINFORCE_ALPHA: string;
   CLAUDE_MEM_CONTEXT_SHOW_TERMINAL_OUTPUT: string;
   CLAUDE_MEM_WELCOME_HINT_ENABLED: string;
+  CLAUDE_MEM_WORK_STATE_ENABLED: string;
   CLAUDE_MEM_FILE_READ_GATE_ENABLED: string;
   CLAUDE_MEM_FOLDER_CLAUDEMD_ENABLED: string;
   CLAUDE_MEM_FOLDER_USE_LOCAL_MD: string;  
@@ -230,6 +256,7 @@ export interface SettingsDefaults {
   CLAUDE_MEM_CODEX_SUBAGENT_INGESTION: string;
   CLAUDE_MEM_MAX_CONCURRENT_AGENTS: string;  
   CLAUDE_MEM_OBSERVER_MAX_CONVERSATION_CHARS: string;
+  CLAUDE_MEM_OBSERVER_THINKING: string;  // Observer thinking param: 'disabled' | 'enabled[:budget]' | 'omit' (#4732)
   CLAUDE_MEM_OBSERVER_CONTEXT_WINDOW: string;  // Observer model context window in tokens; '' = resolve automatically
   CLAUDE_MEM_OBSERVER_MAX_OUTPUT_TOKENS: string;  // Output-token cap on every HTTP observer request (OpenRouter, custom, gateway, Gemini)
   CLAUDE_MEM_OBSERVE_BARE_PROMPTS: string;  // 'true' sends a user prompt to the observer on its own; default 'false' carries it on the next tool event
@@ -238,12 +265,14 @@ export interface SettingsDefaults {
   CLAUDE_MEM_REDACT_DISABLED_BUILTINS: string;
   CLAUDE_MEM_REDACT_CUSTOM_PATTERNS: string;
   CLAUDE_MEM_REDACT_LOG_MATCHES: string;
+  CLAUDE_MEM_REDACT_GENERIC_ENABLED: string;
   CLAUDE_MEM_EXCLUDED_PROJECTS: string;
   CLAUDE_MEM_PROJECT_ENVIRONMENTS: string;
   CLAUDE_MEM_FOLDER_MD_EXCLUDE: string;
   CLAUDE_MEM_FOLDER_MD_SKELETON_DENYLIST: string;
   CLAUDE_MEM_SEMANTIC_INJECT: string;        
   CLAUDE_MEM_SEMANTIC_INJECT_LIMIT: string;  
+  CLAUDE_MEM_SEMANTIC_INJECT_FORMAT: string;
   CLAUDE_MEM_TIER_ROUTING_ENABLED: string;
   CLAUDE_MEM_TIER_SIMPLE_MODEL: string;
   CLAUDE_MEM_TIER_SUMMARY_MODEL: string;
@@ -261,6 +290,8 @@ export interface SettingsDefaults {
   CLAUDE_MEM_CHROMA_MUTATION_TIMEOUT_MS: string;
   CLAUDE_MEM_CHROMA_MAX_PENDING_MUTATIONS: string;
   CLAUDE_MEM_CHROMA_EMBEDDING_FUNCTION: string;  // chroma-mcp embedding function for new collections
+  CLAUDE_MEM_CHROMA_UVX_PATH: string;            // uvx binary (or its folder) to launch chroma-mcp with
+  CLAUDE_MEM_SEARCH_RECENCY_DAYS: string;        // Implicit 90-day recency window on date-less semantic searches (#4770); 0 = no window
   // Worker-native cloud sync. Active ⇔ TOKEN, USER_ID, and HUB_URL are all
   // non-empty — there is no separate enabled flag. HUB_URL points at the
   // two-lane sync hub (workers/sync-hub); while it is empty, sync is OFF
@@ -275,8 +306,15 @@ export interface SettingsDefaults {
   // (#3618). Defaults: 40 ops / 90s (hub projection lease).
   CLAUDE_MEM_CLOUD_SYNC_CONTENT_BATCH_SIZE: string;
   CLAUDE_MEM_CLOUD_SYNC_REQUEST_TIMEOUT_MS: string;
+  // TeamBrain, written by `npx claude-mem teambrain join`. TeamBrain is ON ⇔
+  // TEAMBRAIN_URL is non-empty; its calls authenticate with the cloud sync
+  // token and user id above, so it needs no credential of its own.
+  CLAUDE_MEM_TEAMBRAIN_URL: string;
+  CLAUDE_MEM_TEAMBRAIN_TEAM_ID: string;
   CLAUDE_MEM_LLM_TIMEOUT_MS: string;
   CLAUDE_MEM_FIELD_OPTIMIZE_TIMEOUT_MS: string;
+  CLAUDE_MEM_LLM_STREAM_IDLE_TIMEOUT_MS: string;
+  CLAUDE_MEM_WORKER_HEARTBEAT_STALE_MS: string;
   // Observation TV remote broadcast. EMPTY = OFF: the read-only guard is not
   // mounted and the worker behaves exactly as before. Set (with a non-loopback
   // CLAUDE_MEM_WORKER_HOST) to expose ONLY /tv, /tv.html, /stream and
@@ -359,6 +397,7 @@ export interface SettingsDefaults {
   CLAUDE_MEM_DEDUP_MIN_PROJECT_DOCS: string;       // cold-start: skip fuzzy Tier-1 below N docs/project (IDF unreliable)
   CLAUDE_MEM_DEDUP_MAX_SCAN: string;               // cap Tier-1 candidate scan per insert (logged when hit)
   CLAUDE_MEM_DEDUP_MAX_BACKFILL_ROWS: string;      // dedup-scan safety valve: skip a project larger than this (avoids OOM)
+  CLAUDE_MEM_TOOL_USES_RETENTION_DAYS: string;     // 0 = keep tool_uses forever; N = at worker start, drop rows older than N days that are linked to an observation
   CLAUDE_MEM_WORKER_AUTOSTART: string;
   CLAUDE_MEM_PROJECT_NAME_SOURCE: string;
 }
@@ -374,6 +413,8 @@ export class SettingsDefaultsManager {
     CLAUDE_MEM_SESSION_START_INCLUDE_ALL_SOURCES: 'false',
     CLAUDE_MEM_WORKER_PORT: String(37700 + ((process.getuid?.() ?? 77) % 100)),
     CLAUDE_MEM_WORKER_HOST: '127.0.0.1',
+    CLAUDE_MEM_WORKER_INGEST_TOKEN: '',
+    CLAUDE_MEM_HOOK_SPOOL_TRANSPORT: 'auto',
     CLAUDE_MEM_ALLOWED_ORIGINS: '',  // Comma-separated browser origins allowed to call the worker
                                      // cross-origin besides http://localhost:* / http://127.0.0.1:*.
                                      // Their host names also pass the DNS-rebinding Host check.
@@ -390,7 +431,7 @@ export class SettingsDefaultsManager {
     // while transcript watches run.
     CLAUDE_MEM_IDLE_EXIT_SEC: '0',
     CLAUDE_MEM_SKIP_TOOLS: 'ListMcpResourcesTool,SlashCommand,Skill,TodoWrite,AskUserQuestion',
-    CLAUDE_MEM_SKIP_BASH_PATTERNS: '',  // Regex matched against a shell command (Bash; Codex exec_command); when it matches, the observation is skipped. Empty = capture every command. Use alternation for several patterns, e.g. ^(ls|cat|pwd)\b
+    CLAUDE_MEM_SKIP_BASH_PATTERNS: '',  // Regex matched against a shell command (Bash; PowerShell; Codex exec_command); when it matches, the observation is skipped. Empty = capture every command. Use alternation for several patterns, e.g. ^(ls|cat|pwd)\b
     CLAUDE_MEM_SKIP_SUBAGENT_OBSERVATIONS: 'false',  // #2736 — default off preserves current behavior; set 'true' to skip every subagent observation (recommended for heavy Dynamic Workflows users)
     CLAUDE_MEM_SKIP_AGENT_TYPES: '',                 // #2736 — default empty preserves current behavior; recommended value 'workflow-subagent' to drop Dynamic Workflows fan-out noise
     CLAUDE_MEM_CAPTURE_ADVISOR_CALLS: 'false',       // #3165 — opt-in: the Stop hook scans the transcript's tail for advisor calls and stores the advice locally (worker runtime only)
@@ -405,6 +446,7 @@ export class SettingsDefaultsManager {
     CLAUDE_MEM_CODEX_MAX_CONCURRENT_AGENTS: '2',
     CLAUDE_MEM_CODEX_OBSERVATION_BATCH_SIZE: '8',
     CLAUDE_MEM_CODEX_OBSERVATION_BATCH_MAX_CHARS: '32000',
+    CLAUDE_MEM_CLAUDE_OBSERVATION_BATCH_SIZE: '1', // Queued same-context events per Claude observer prompt (1-32). 1 = one event per prompt.
     CLAUDE_MEM_CLAUDE_AUTH_METHOD: 'subscription',  // Default to logged-in Claude SDK auth (not API key)
     CLAUDE_MEM_GEMINI_API_KEY: '',  // Empty by default, can be set via UI or env
     CLAUDE_MEM_GEMINI_API_KEYS: '',  // Optional extra keys (newline/comma separated). Rotates on rate_limit/quota_exhausted/auth_invalid — see src/shared/api-key-pool.ts.
@@ -420,6 +462,7 @@ export class SettingsDefaultsManager {
     // id to RETIRED_OPENROUTER_DEFAULT_MODELS.
     CLAUDE_MEM_OPENROUTER_MODEL: 'cohere/north-mini-code:free',
     CLAUDE_MEM_OPENROUTER_BASE_URL: '',  // #2382/#2590/#2622/#2393 — optional OpenAI-compatible base URL (e.g. https://api.deepseek.com, http://localhost:1234/v1). Empty = default OpenRouter endpoint.
+    CLAUDE_MEM_OPENROUTER_TEMPERATURE: '',
     CLAUDE_MEM_OPENROUTER_SITE_URL: '',  // Optional: for OpenRouter analytics
     CLAUDE_MEM_OPENROUTER_APP_NAME: 'claude-mem',  // App name for OpenRouter analytics
     // JSON object of provider-specific request fields, e.g. {"reasoning":{"enabled":false}}.
@@ -431,7 +474,7 @@ export class SettingsDefaultsManager {
     CLAUDE_MEM_OPENAI_COMPAT_API_KEYS: '',  // Optional extra keys (newline/comma separated) for the openai-compatible provider.
     CLAUDE_MEM_OPENAI_COMPAT_BASE_URL: '',  // OpenAI-compatible base URL, e.g. https://integrate.api.nvidia.com/v1. Overrides the preset's base URL when set.
     CLAUDE_MEM_OPENAI_COMPAT_MODEL: '',  // Model id passed verbatim. Empty = the preset's default model.
-    CLAUDE_MEM_QUOTA_FALLBACK_PROVIDER: '',  // '' = off | 'claude' | 'gemini' | 'openrouter' | 'openai-compatible': where observer work goes while the selected provider's quota breaker holds (a spent allowance, or rate limits that outlast their retries)
+    CLAUDE_MEM_QUOTA_FALLBACK_PROVIDER: 'claude',  // 'claude' (the Anthropic plan; '' means this too) | 'gemini' | 'openrouter' | 'openai-compatible' | 'off': where observer work goes while the selected provider cannot serve (spent allowance, rate limit or over capacity past its retries, outage, repeated unusable replies). Claude is used only when a Claude login or key exists
     CLAUDE_MEM_QUOTA_FALLBACK_MODEL: '',     // Claude model for a Claude fallback run; '' = CLAUDE_MEM_MODEL and tier routing. Ignored for other fallbacks (only ClaudeProvider reads modelOverride)
     CLAUDE_MEM_QUOTA_THRESHOLD_FIVE_HOUR: '0.95',          // Quota guard (#4230): subscription observer stops at this utilization of the window. A provider rejection always stops it
     CLAUDE_MEM_QUOTA_THRESHOLD_SEVEN_DAY: '0.93',
@@ -443,6 +486,7 @@ export class SettingsDefaultsManager {
     CLAUDE_MEM_PYTHON_VERSION: '3.13',
     CLAUDE_CODE_PATH: '', // Empty means auto-detect via 'which claude'
     CLAUDE_MEM_CLAUDE_CONFIG_DIR: '', // #2753 — override CLAUDE_CONFIG_DIR for the keychain lookup + SDK subprocess only; empty = fall through to process.env.CLAUDE_CONFIG_DIR/default
+    CLAUDE_MEM_OBSERVER_CLAUDE_CONFIG_DIR: '', // #4689 — transcript-only CLAUDE_CONFIG_DIR for the SDK subprocess (out of ~/.claude/projects); credentials stay on the default profile; only honored when CLAUDE_MEM_CLAUDE_CONFIG_DIR is empty
     CLAUDE_MEM_MODE: 'code', // Default mode profile
     CLAUDE_MEM_CONTEXT_SHOW_READ_TOKENS: 'false',
     CLAUDE_MEM_CONTEXT_SHOW_WORK_TOKENS: 'false',
@@ -459,6 +503,7 @@ export class SettingsDefaultsManager {
     CLAUDE_MEM_REINFORCE_ALPHA: '0',  // ACT-R reinforcement weight for SessionStart ranking. 0 = off (the N most recent observations, unchanged); >0 lets re-confirmed older observations climb into the window
     CLAUDE_MEM_CONTEXT_SHOW_TERMINAL_OUTPUT: 'true',
     CLAUDE_MEM_WELCOME_HINT_ENABLED: 'true',
+    CLAUDE_MEM_WORK_STATE_ENABLED: 'true',  // 'false' = no work-state section at SessionStart and no work_state_* MCP tools, for hosts that track work their own way
     CLAUDE_MEM_FILE_READ_GATE_ENABLED: 'true',  // 'false' = never block a full-file Read; the file's observation timeline is still added as context
     CLAUDE_MEM_FOLDER_CLAUDEMD_ENABLED: 'false',
     CLAUDE_MEM_FOLDER_USE_LOCAL_MD: 'false',  // When true, writes to CLAUDE.local.md instead of CLAUDE.md
@@ -471,6 +516,7 @@ export class SettingsDefaultsManager {
     CLAUDE_MEM_CODEX_SUBAGENT_INGESTION: 'false',
     CLAUDE_MEM_MAX_CONCURRENT_AGENTS: '2',  // Max concurrent Claude SDK agent subprocesses
     CLAUDE_MEM_OBSERVER_MAX_CONVERSATION_CHARS: '400000',  // Retire an observer conversation past this size and start a fresh generation (#3800)
+    CLAUDE_MEM_OBSERVER_THINKING: 'disabled',  // Observer thinking param: 'disabled' (shipped) | 'enabled[:budget]' | 'omit' — an always-thinking gateway upstream rejects 'disabled' with 400/1210 (#4732)
     CLAUDE_MEM_OBSERVER_CONTEXT_WINDOW: '',  // Observer model context window in tokens; '' = resolve it (OpenRouter catalogue, Gemini/Claude maps). Lowers the budget above to half the window (#3625)
     CLAUDE_MEM_OBSERVER_MAX_OUTPUT_TOKENS: '4096',  // max_tokens / max_completion_tokens / Gemini maxOutputTokens on every HTTP observer request (#3868)
     CLAUDE_MEM_OBSERVE_BARE_PROMPTS: 'false',  // 'true' restores one observer call per user prompt; 'false' carries the prompt on the next tool event's call
@@ -479,12 +525,14 @@ export class SettingsDefaultsManager {
     CLAUDE_MEM_REDACT_DISABLED_BUILTINS: '',              // CSV of built-in pattern names to disable, e.g. 'jwt,slack_token'
     CLAUDE_MEM_REDACT_CUSTOM_PATTERNS: '[]',              // JSON array of { name, regex } objects
     CLAUDE_MEM_REDACT_LOG_MATCHES: 'false',               // Log pattern,count per invocation (no payload)
+    CLAUDE_MEM_REDACT_GENERIC_ENABLED: 'false',           // #4745 — opt-in: also redact un-prefixed credentials (password=, *_TOKEN=, *_SECRET=, *_API_KEY=, Authorization: Bearer)
     CLAUDE_MEM_EXCLUDED_PROJECTS: '',  // Comma-separated glob patterns for excluded project paths
     CLAUDE_MEM_PROJECT_ENVIRONMENTS: '[]',  // JSON array of {"name","patterns"}: directories matching an environment's globs share one project named after it
     CLAUDE_MEM_FOLDER_MD_EXCLUDE: '[]',  // JSON array of folder paths to exclude from CLAUDE.md generation
     CLAUDE_MEM_FOLDER_MD_SKELETON_DENYLIST: '[]',  // #2400 — JSON array of glob patterns; when a folder matches AND its generated CLAUDE.md would be empty/skeleton, skip injection (avoids polluting non-content dirs with empty skeletons). Default [] preserves existing behavior.
     CLAUDE_MEM_SEMANTIC_INJECT: 'false',             // Inject relevant past observations on every UserPromptSubmit (experimental, disabled by default)
     CLAUDE_MEM_SEMANTIC_INJECT_LIMIT: '5',           // Top-N most relevant observations to inject per prompt
+    CLAUDE_MEM_SEMANTIC_INJECT_FORMAT: 'narrative',  // 'narrative' = title + full narrative per match; 'index' = id + title + subtitle, expanded via get_observations
     CLAUDE_MEM_TIER_ROUTING_ENABLED: 'true',         // Route observations to models by complexity
     CLAUDE_MEM_TIER_SIMPLE_MODEL: 'haiku', // Portable tier alias — works across Direct API, Bedrock, Vertex, Azure (see #1463)
     CLAUDE_MEM_TIER_SUMMARY_MODEL: '',                // Empty = use default model for summaries
@@ -508,6 +556,8 @@ export class SettingsDefaultsManager {
     // memory text to that vendor. Any other value is rejected. Applies to new
     // collections only — changing it requires re-indexing.
     CLAUDE_MEM_CHROMA_EMBEDDING_FUNCTION: 'default',
+    CLAUDE_MEM_CHROMA_UVX_PATH: '',            // Empty = search uv's install folders, then PATH (#4195)
+    CLAUDE_MEM_SEARCH_RECENCY_DAYS: '90',      // Date-less semantic search only ranks matches from the last N days (#4770). 0 = no window (every match eligible); an explicit dateStart/dateEnd always wins. Restart the worker after changing it
     // Worker-native cloud sync: credentials come from cmem.ai → Connect.
     CLAUDE_MEM_CLOUD_SYNC_TOKEN: '',
     CLAUDE_MEM_CLOUD_SYNC_USER_ID: '',
@@ -517,8 +567,12 @@ export class SettingsDefaultsManager {
     CLAUDE_MEM_CLOUD_SYNC_WS: 'true',  // Live updates (Supabase Realtime `advance` broadcasts). 'false' disables live updates — sync stays fully correct, just poll-latency (prime directive #2)
     CLAUDE_MEM_CLOUD_SYNC_CONTENT_BATCH_SIZE: '40',  // Drain page size; 200-op content pushes timed out under hub projection_busy
     CLAUDE_MEM_CLOUD_SYNC_REQUEST_TIMEOUT_MS: '90000',  // Content-push AbortSignal; matches hub PROJECTION_LEASE_MS (90s)
+    CLAUDE_MEM_TEAMBRAIN_URL: '',      // TeamBrain base URL (e.g. https://cmem.ai). Empty = TeamBrain OFF
+    CLAUDE_MEM_TEAMBRAIN_TEAM_ID: '',  // The team this install joined (teambrain share/leave default to it)
     CLAUDE_MEM_LLM_TIMEOUT_MS: String(DEFAULT_LLM_TIMEOUT_MS),  // Per-attempt deadline for non-streamed observer requests (retry.ts); streamed OpenRouter/OpenAI-compatible requests use a 90s idle timeout + 300s cap (streamed-chat-completion.ts)
     CLAUDE_MEM_FIELD_OPTIMIZE_TIMEOUT_MS: String(DEFAULT_LLM_TIMEOUT_MS),  // Oversized-field condensation deadline (field-optimizer.ts); a request to the same backend, so the same deadline
+    CLAUDE_MEM_LLM_STREAM_IDLE_TIMEOUT_MS: '90000',  // Streamed request idle window (streamed-chat-completion.ts): silence that ends a stream. Self-hosted backends queue behind a load balancer, and the queue wait reads as idle (#4737) — raise it there. Literal because shared cannot import from the worker; a drift test pins it to the shipped constant
+    CLAUDE_MEM_WORKER_HEARTBEAT_STALE_MS: '120000', // A silent worker whose liveness heartbeat is younger than this is slow, not dead (10000-3600000).
     // Observation TV remote broadcast. EMPTY = OFF: the read-only guard is not
     // mounted and the worker behaves exactly as before. Set (with a non-loopback
     // CLAUDE_MEM_WORKER_HOST) to expose ONLY /tv, /tv.html, /stream and
@@ -598,6 +652,7 @@ export class SettingsDefaultsManager {
     CLAUDE_MEM_DEDUP_MIN_PROJECT_DOCS: '10',            // cold-start gate: IDF unreliable below ~10 docs/project
     CLAUDE_MEM_DEDUP_MAX_SCAN: '2000',                  // per-insert candidate-scan cap (logged when exceeded)
     CLAUDE_MEM_DEDUP_MAX_BACKFILL_ROWS: '50000',        // dedup-scan skips a project with more rows than this (memory safety)
+    CLAUDE_MEM_TOOL_USES_RETENTION_DAYS: '0',           // 0 = keep forever (default); N = purge linked tool_uses older than N days at worker start
     CLAUDE_MEM_WORKER_AUTOSTART: 'true',                    // 'false' = the worker is managed externally: hooks, the MCP server and `start` use a running worker but never launch, kill or recycle one.
     CLAUDE_MEM_PROJECT_NAME_SOURCE: 'path',                 // 'path' (default) = folder/git-root basename; 'git-remote' = stable org/repo slug from the git `origin` URL (survives directory renames). Opt-in; default preserves existing behavior.
   };
@@ -643,20 +698,26 @@ export class SettingsDefaultsManager {
     return result;
   }
 
-  static loadFromFile(settingsPath: string, applyEnvOverrides = true): SettingsDefaults {
+  static loadFromFile(
+    settingsPath: string,
+    applyEnvOverrides = true,
+    options: { readOnly?: boolean } = {},
+  ): SettingsDefaults {
     try {
       if (!existsSync(settingsPath)) {
         const defaults = this.getAllDefaults();
-        try {
-          writeJsonFileAtomic(settingsPath, defaults, { mode: 0o600 });
-          // A fresh file already holds the raised deadlines: nothing to move.
-          for (const raised of RAISED_DEADLINE_DEFAULTS) markRaisedDefaultDone(settingsPath, raised);
-          // stderr, never stdout: this fires on the first boot in a fresh data
-          // dir, and CLI commands like `start` promise machine-readable JSON
-          // on stdout to the hook framework.
-          console.warn('[SETTINGS] Created settings file with defaults:', settingsPath);
-        } catch (error: unknown) {
-          console.warn('[SETTINGS] Failed to create settings file, using in-memory defaults:', settingsPath, error instanceof Error ? error.message : String(error));
+        if (!options.readOnly) {
+          try {
+            writeJsonFileAtomic(settingsPath, defaults, { mode: 0o600 });
+            // A fresh file already holds the raised deadlines: nothing to move.
+            for (const raised of RAISED_DEADLINE_DEFAULTS) markRaisedDefaultDone(settingsPath, raised);
+            // stderr, never stdout: this fires on the first boot in a fresh data
+            // dir, and CLI commands like `start` promise machine-readable JSON
+            // on stdout to the hook framework.
+            console.warn('[SETTINGS] Created settings file with defaults:', settingsPath);
+          } catch (error: unknown) {
+            console.warn('[SETTINGS] Failed to create settings file, using in-memory defaults:', settingsPath, error instanceof Error ? error.message : String(error));
+          }
         }
         return this.finalizeSettings(defaults, applyEnvOverrides);
       }
@@ -676,7 +737,7 @@ export class SettingsDefaultsManager {
         // A legacy file containing only `{ env: {...} }` can be flattened
         // safely. If it also contains peer root keys (hooks, permissions,
         // theme, etc.), retain the wrapper: flattening would destroy user data.
-        if (!hasPeerRootKeys) {
+        if (!hasPeerRootKeys && !options.readOnly) {
           try {
             writeJsonFileAtomic(settingsPath, flatSettings, { mode: 0o600 });
             // stderr, never stdout — same JSON-on-stdout contract as above.
@@ -694,17 +755,19 @@ export class SettingsDefaultsManager {
           CLAUDE_MEM_TELEGRAM_TRIGGER_TYPES: this.DEFAULTS.CLAUDE_MEM_TELEGRAM_TRIGGER_TYPES,
         };
 
-        try {
-          writeJsonFileAtomic(
-            settingsPath,
-            hasPeerRootKeys ? { ...writableRoot, env: flatSettings } : flatSettings,
-            { mode: 0o600 },
-          );
-          // stderr, never stdout — same JSON-on-stdout contract as above.
-          console.warn('[SETTINGS] Migrated Telegram trigger types off the legacy default:', settingsPath);
-        } catch (error: unknown) {
-          console.warn('[SETTINGS] Failed to migrate Telegram trigger types:', settingsPath, error instanceof Error ? error.message : String(error));
-          // Continue with the in-memory migration even if the write fails
+        if (!options.readOnly) {
+          try {
+            writeJsonFileAtomic(
+              settingsPath,
+              hasPeerRootKeys ? { ...writableRoot, env: flatSettings } : flatSettings,
+              { mode: 0o600 },
+            );
+            // stderr, never stdout — same JSON-on-stdout contract as above.
+            console.warn('[SETTINGS] Migrated Telegram trigger types off the legacy default:', settingsPath);
+          } catch (error: unknown) {
+            console.warn('[SETTINGS] Failed to migrate Telegram trigger types:', settingsPath, error instanceof Error ? error.message : String(error));
+            // Continue with the in-memory migration even if the write fails
+          }
         }
       }
 
@@ -715,20 +778,22 @@ export class SettingsDefaultsManager {
           CLAUDE_MEM_OPENROUTER_MODEL: this.DEFAULTS.CLAUDE_MEM_OPENROUTER_MODEL,
         };
 
-        try {
-          writeJsonFileAtomic(
-            settingsPath,
-            hasPeerRootKeys ? { ...writableRoot, env: flatSettings } : flatSettings,
-            { mode: 0o600 },
-          );
-          // stderr, never stdout — same JSON-on-stdout contract as above.
-          console.warn(
-            `[SETTINGS] Migrated OpenRouter model off the retired default ${retiredModel} to ${this.DEFAULTS.CLAUDE_MEM_OPENROUTER_MODEL}:`,
-            settingsPath,
-          );
-        } catch (error: unknown) {
-          console.warn('[SETTINGS] Failed to migrate the retired OpenRouter model:', settingsPath, error instanceof Error ? error.message : String(error));
-          // Continue with the in-memory migration even if the write fails
+        if (!options.readOnly) {
+          try {
+            writeJsonFileAtomic(
+              settingsPath,
+              hasPeerRootKeys ? { ...writableRoot, env: flatSettings } : flatSettings,
+              { mode: 0o600 },
+            );
+            // stderr, never stdout — same JSON-on-stdout contract as above.
+            console.warn(
+              `[SETTINGS] Migrated OpenRouter model off the retired default ${retiredModel} to ${this.DEFAULTS.CLAUDE_MEM_OPENROUTER_MODEL}:`,
+              settingsPath,
+            );
+          } catch (error: unknown) {
+            console.warn('[SETTINGS] Failed to migrate the retired OpenRouter model:', settingsPath, error instanceof Error ? error.message : String(error));
+            // Continue with the in-memory migration even if the write fails
+          }
         }
       }
 
@@ -739,22 +804,24 @@ export class SettingsDefaultsManager {
           CLAUDE_MEM_CLOUD_SYNC_HUB_URL: rewrittenHubUrl,
         };
 
-        try {
-          writeJsonFileAtomic(
-            settingsPath,
-            hasPeerRootKeys ? { ...writableRoot, env: flatSettings } : flatSettings,
-            { mode: 0o600 },
-          );
-          console.warn('[SETTINGS] Migrated cloud sync hub URL to', rewrittenHubUrl, 'from a retired hub host:', settingsPath);
-        } catch (error: unknown) {
-          console.warn('[SETTINGS] Failed to migrate cloud sync hub URL:', settingsPath, error instanceof Error ? error.message : String(error));
+        if (!options.readOnly) {
+          try {
+            writeJsonFileAtomic(
+              settingsPath,
+              hasPeerRootKeys ? { ...writableRoot, env: flatSettings } : flatSettings,
+              { mode: 0o600 },
+            );
+            console.warn('[SETTINGS] Migrated cloud sync hub URL to', rewrittenHubUrl, 'from a retired hub host:', settingsPath);
+          } catch (error: unknown) {
+            console.warn('[SETTINGS] Failed to migrate cloud sync hub URL:', settingsPath, error instanceof Error ? error.message : String(error));
+          }
         }
       }
 
       for (const raised of RAISED_DEADLINE_DEFAULTS) {
         if (existsSync(raisedDefaultMarkerPath(settingsPath, raised))) continue;
         if (flatSettings[raised.key] !== raised.legacy) {
-          markRaisedDefaultDone(settingsPath, raised);
+          if (!options.readOnly) markRaisedDefaultDone(settingsPath, raised);
           continue;
         }
         flatSettings = {
@@ -762,29 +829,31 @@ export class SettingsDefaultsManager {
           [raised.key]: this.DEFAULTS[raised.key],
         };
 
-        try {
-          writeJsonFileAtomic(
-            settingsPath,
-            hasPeerRootKeys ? { ...writableRoot, env: flatSettings } : flatSettings,
-            { mode: 0o600 },
-          );
-          markRaisedDefaultDone(settingsPath, raised);
-          // stderr, never stdout — same JSON-on-stdout contract as above.
-          console.warn(
-            `[SETTINGS] Migrated ${raised.key} off the old ${raised.legacy}ms default to ${this.DEFAULTS[raised.key]}ms:`,
-            settingsPath,
-          );
-        } catch (error: unknown) {
-          // Continue with the in-memory migration even if the write fails; with
-          // no marker, the next load tries the rewrite again.
-          const reported = `${raised.key}\0${settingsPath}`;
-          if (!raisedDefaultFailuresReported.has(reported)) {
-            raisedDefaultFailuresReported.add(reported);
-            console.warn(
-              `[SETTINGS] Failed to migrate ${raised.key}; using the new default in memory (reported once per process):`,
+        if (!options.readOnly) {
+          try {
+            writeJsonFileAtomic(
               settingsPath,
-              error instanceof Error ? error.message : String(error),
+              hasPeerRootKeys ? { ...writableRoot, env: flatSettings } : flatSettings,
+              { mode: 0o600 },
             );
+            markRaisedDefaultDone(settingsPath, raised);
+            // stderr, never stdout — same JSON-on-stdout contract as above.
+            console.warn(
+              `[SETTINGS] Migrated ${raised.key} off the old ${raised.legacy}ms default to ${this.DEFAULTS[raised.key]}ms:`,
+              settingsPath,
+            );
+          } catch (error: unknown) {
+            // Continue with the in-memory migration even if the write fails; with
+            // no marker, the next load tries the rewrite again.
+            const reported = `${raised.key}\0${settingsPath}`;
+            if (!raisedDefaultFailuresReported.has(reported)) {
+              raisedDefaultFailuresReported.add(reported);
+              console.warn(
+                `[SETTINGS] Failed to migrate ${raised.key}; using the new default in memory (reported once per process):`,
+                settingsPath,
+                error instanceof Error ? error.message : String(error),
+              );
+            }
           }
         }
       }
@@ -792,7 +861,7 @@ export class SettingsDefaultsManager {
       const result: SettingsDefaults = { ...this.DEFAULTS };
       for (const key of Object.keys(this.DEFAULTS) as Array<keyof SettingsDefaults>) {
         if (flatSettings[key] !== undefined) {
-          result[key] = flatSettings[key];
+          result[key] = coercePersistedSettingValue(flatSettings[key]) as string;
         }
       }
 

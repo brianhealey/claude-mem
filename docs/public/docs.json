@@ -37,6 +37,8 @@
           "installation",
           "t3code-integration",
           "usage/getting-started",
+          "usage/my-work",
+          "usage/teambrain",
           "usage/openrouter-provider",
           "usage/gemini-provider",
           "usage/openai-compatible-provider",
@@ -96,11 +98,12 @@
           "modes",
           "telemetry",
           "development",
-          "branches",
           "troubleshooting",
           "platform-integration",
           "openclaw-integration",
-          "kimi-integration"
+          "kimi-integration",
+          "qoder-integration",
+          "screenpipe-integration"
         ]
       },
       {
@@ -178,5 +181,11 @@
     "telemetry": {
       "enabled": false
     }
-  }
+  },
+  "redirects": [
+    {
+      "source": "/branches",
+      "destination": "/development"
+    }
+  ]
 }

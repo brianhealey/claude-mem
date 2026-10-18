@@ -22,7 +22,13 @@ import { buildProjectWhereFilter, projectReadKeysFor } from '../project-where-fi
 export class ChromaSearchStrategy {
   constructor(
     private chromaSync: ChromaSync,
-    private sessionStore: SessionStore
+    private sessionStore: SessionStore,
+    /**
+     * Implicit window, in milliseconds, that date-less searches apply to
+     * Chroma matches (CLAUDE_MEM_SEARCH_RECENCY_DAYS). 0 disables it; an
+     * explicit `dateRange` on a request always wins over it.
+     */
+    private defaultRecencyWindowMs: number = SEARCH_CONSTANTS.RECENCY_WINDOW_MS
   ) {}
 
   private emptyResult(strategy: 'chroma'): StrategySearchResult {
@@ -41,6 +47,7 @@ export class ChromaSearchStrategy {
       concepts,
       files,
       limit = SEARCH_CONSTANTS.DEFAULT_LIMIT,
+      offset = 0,
       project,
       projects,
       platformSource,
@@ -66,7 +73,7 @@ export class ChromaSearchStrategy {
 
     return await this.executeChromaSearch(query, whereFilter, {
       searchObservations, searchSessions, searchPrompts,
-      obsType, concepts, files, orderBy, limit, project,
+      obsType, concepts, files, orderBy, limit, offset, project,
       projects: readKeys.length > 0 ? readKeys : undefined,
       platformSource, dateRange, ignoreDefaultRecencyWindow
     });
@@ -84,6 +91,7 @@ export class ChromaSearchStrategy {
       files?: string | string[];
       orderBy: 'relevance' | 'date_desc' | 'date_asc';
       limit: number;
+      offset: number;
       project?: string;
       projects?: string[];
       platformSource?: string;
@@ -93,7 +101,7 @@ export class ChromaSearchStrategy {
   ): Promise<StrategySearchResult> {
     const chromaResults = await this.chromaSync.queryChroma(
       query,
-      SEARCH_CONSTANTS.CHROMA_BATCH_SIZE,
+      Math.max(SEARCH_CONSTANTS.CHROMA_BATCH_SIZE, Number(options.offset) + Number(options.limit)),
       whereFilter
     );
 
@@ -113,6 +121,9 @@ export class ChromaSearchStrategy {
     let prompts: UserPromptSearchResult[] = [];
 
     const sqlOrderBy = options.orderBy;
+    const offset = Number(options.offset);
+    const limit = Number(options.limit);
+    const candidateLimit = offset + limit;
 
     if (categorized.obsIds.length > 0) {
       const obsOptions = {
@@ -120,7 +131,7 @@ export class ChromaSearchStrategy {
         concepts: options.concepts,
         files: options.files,
         orderBy: sqlOrderBy,
-        limit: options.limit,
+        limit: candidateLimit,
         project: options.project,
         projects: options.projects,
         platformSource: options.platformSource
@@ -131,7 +142,7 @@ export class ChromaSearchStrategy {
     if (categorized.sessionIds.length > 0) {
       sessions = this.sessionStore.getSessionSummariesByIds(categorized.sessionIds, {
         orderBy: sqlOrderBy,
-        limit: options.limit,
+        limit: candidateLimit,
         project: options.project,
         projects: options.projects,
         platformSource: options.platformSource
@@ -141,7 +152,7 @@ export class ChromaSearchStrategy {
     if (categorized.promptIds.length > 0) {
       prompts = this.sessionStore.getUserPromptsByIds(categorized.promptIds, {
         orderBy: sqlOrderBy,
-        limit: options.limit,
+        limit: candidateLimit,
         project: options.project,
         projects: options.projects,
         platformSource: options.platformSource
@@ -149,7 +160,11 @@ export class ChromaSearchStrategy {
     }
 
     return {
-      results: { observations, sessions, prompts },
+      results: {
+        observations: observations.slice(offset, offset + limit),
+        sessions: sessions.slice(offset, offset + limit),
+        prompts: prompts.slice(offset, offset + limit),
+      },
       usedChroma: true,
       strategy: 'chroma'
     };
@@ -192,8 +207,8 @@ export class ChromaSearchStrategy {
       if (dateRange.end) {
         endEpoch = resolveDateBound(dateRange.end, 'end');
       }
-    } else if (!ignoreDefaultRecencyWindow) {
-      startEpoch = Date.now() - SEARCH_CONSTANTS.RECENCY_WINDOW_MS;
+    } else if (!ignoreDefaultRecencyWindow && this.defaultRecencyWindowMs > 0) {
+      startEpoch = Date.now() - this.defaultRecencyWindowMs;
     }
 
     // ChromaSync deduplicates by (document type, SQLite id) and returns

@@ -7,6 +7,7 @@ import { SearchManager } from '../../SearchManager.js';
 import type { SearchTelemetryEnvelope } from '../../SearchManager.js';
 import { BaseRouteHandler } from '../BaseRouteHandler.js';
 import { AppError } from '../../../server/ErrorHandler.js';
+import { resolveDateBound } from '../../../../shared/date-bounds.js';
 import { scopedProjects } from '../../../sqlite/project-read-keys.js';
 import { validateBody } from '../middleware/validateBody.js';
 import { logger } from '../../../../utils/logger.js';
@@ -29,6 +30,7 @@ interface ContextInjectRender {
   cacheable: boolean;
 }
 import { buildWorkStateContextSection } from '../../../context/sections/WorkStateRenderer.js';
+import { isWorkStateEnabled } from '../../../../shared/work-state-setting.js';
 import { SettingsDefaultsManager } from '../../../../shared/SettingsDefaultsManager.js';
 import { getViewerBaseUrl } from '../../../../shared/worker-utils.js';
 import { USER_SETTINGS_PATH } from '../../../../shared/paths.js';
@@ -39,6 +41,7 @@ import type { ObservationSearchResult, SessionSummarySearchResult } from '../../
 import { captureEvent } from '../../../telemetry/telemetry.js';
 import { telemetryBuffer } from '../../../telemetry/buffer.js';
 import { proTrialLine } from '../../../../shared/pro-promo.js';
+import { teamBriefReserveChars } from '../../../../shared/teambrain.js';
 import { ProgressiveMemorySearch } from '../../ProgressiveMemorySearch.js';
 import { progressiveSearchToolResult, progressiveSearchToolError, type ProgressiveSearchInput } from '../../../../shared/progressive-search.js';
 
@@ -101,6 +104,7 @@ const semanticContextSchema = z.object({
   // Every key the checkout reads (gate P2-5); a list, or comma-separated.
   projects: z.union([z.array(z.string()), z.string()]).optional(),
   limit: z.union([z.string(), z.number()]).optional(),
+  format: z.string().optional(),
   platformSource: z.string().optional(),
   platform_source: z.string().optional(),
 }).passthrough();
@@ -113,6 +117,7 @@ export class SearchRoutes extends BaseRouteHandler {
   // Scope this cache to the route instance so separate server/test instances do
   // not inherit each other's positive observation state through shared modules.
   private readonly projectsKnownNonEmpty = new Set<string>();
+  private projectsKnownNonEmptyGeneration: number | undefined;
 
   constructor(
     private searchManager: SearchManager,
@@ -156,13 +161,18 @@ export class SearchRoutes extends BaseRouteHandler {
     projects: string[],
     platformSource?: string,
   ): boolean {
+    const removalGeneration = this.contextCache?.removalGenerationNow();
+    if (removalGeneration !== this.projectsKnownNonEmptyGeneration) {
+      this.projectsKnownNonEmpty.clear();
+      this.projectsKnownNonEmptyGeneration = removalGeneration;
+    }
     const cacheKey = platformSource ? `${platformSource}\0${projects.join('\0')}` : projects.join('\0');
-    if (this.projectsKnownNonEmpty.has(cacheKey)) {
+    if (removalGeneration !== undefined && this.projectsKnownNonEmpty.has(cacheKey)) {
       return true;
     }
     const observationCount = countObservationsByProjects(sessionStore, projects, platformSource);
     if (observationCount > 0) {
-      this.projectsKnownNonEmpty.add(cacheKey);
+      if (removalGeneration !== undefined) this.projectsKnownNonEmpty.add(cacheKey);
       return true;
     }
     return false;
@@ -494,14 +504,18 @@ export class SearchRoutes extends BaseRouteHandler {
     // The agent's open to-do lists and working state lead every answer this
     // route gives a session, the welcome hint included; memory is fitted to
     // what that leaves of the 10K delivery limit. The terminal preview is for
-    // the human and goes without it.
-    const workStateSection = forHuman
+    // the human and goes without it, and so does a session whose host turned
+    // work state off (CLAUDE_MEM_WORK_STATE_ENABLED=false, #4606).
+    const settings = this.getCachedSettings();
+    const workStateEnabled = isWorkStateEnabled(
+      process.env.CLAUDE_MEM_WORK_STATE_ENABLED ?? settings.CLAUDE_MEM_WORK_STATE_ENABLED,
+    );
+    const workStateSection = forHuman || !workStateEnabled
       ? ''
       : buildWorkStateContextSection(this.searchManager.getSessionStore().getWorkStateEntries(projects), 'placeholders');
     const withWorkState = (text: string): string =>
       workStateSection && text ? `${workStateSection}\n\n${text}` : workStateSection || text;
 
-    const settings = this.getCachedSettings();
     // Env always wins over cached settings (mirrors SettingsDefaultsManager
     // applyEnvOverrides semantics). Reading process.env is free, so honoring it
     // here keeps the welcome-hint toggle responsive without waiting out the
@@ -539,7 +553,13 @@ export class SearchRoutes extends BaseRouteHandler {
       projects: projects,
       ...(platformSource ? { platformSource } : {}),
       full,
-      reserveChars: workStateSection ? workStateSection.length + 2 : 0,
+      // Beside the work-state section: room for what the hook appends after
+      // this body once the install is in a team (the TeamBrain brief). Env
+      // first, as the hook reads it.
+      reserveChars: (workStateSection ? workStateSection.length + 2 : 0) + teamBriefReserveChars({
+        CLAUDE_MEM_TEAMBRAIN_URL: process.env.CLAUDE_MEM_TEAMBRAIN_URL ?? settings.CLAUDE_MEM_TEAMBRAIN_URL,
+        CLAUDE_MEM_MEMORY_INSTRUCTIONS_ENABLED: process.env.CLAUDE_MEM_MEMORY_INSTRUCTIONS_ENABLED ?? settings.CLAUDE_MEM_MEMORY_INSTRUCTIONS_ENABLED,
+      }),
       timePlaceholders: true,
       includePriorMessage: request.includePriorMessage,
     }, forHuman);
@@ -582,6 +602,21 @@ export class SearchRoutes extends BaseRouteHandler {
       return;
     }
 
+    const format = SearchRoutes.firstString(req.body?.format) ?? SearchRoutes.firstString(req.query.format);
+    if (format === 'index') {
+      // Progressive disclosure: one line per match, expanded on demand. Costs a
+      // fraction of a narrative per match, but a match only becomes content if
+      // the model calls get_observations, which is why narrative is the default.
+      const lines: string[] = ['## Relevant Past Work (semantic match)\n'];
+      for (const obs of observations.slice(0, limit)) {
+        const date = obs.created_at?.slice(0, 10) || '';
+        lines.push(`- #${obs.id} ${obs.title || 'Observation'}${obs.subtitle ? ` — ${obs.subtitle}` : ''} (${date})`);
+      }
+      lines.push('', 'Call get_observations with the ids above to read the full details of any that bear on this prompt.');
+      res.json({ context: lines.join('\n'), count: observations.length });
+      return;
+    }
+
     const lines: string[] = ['## Relevant Past Work (semantic match)\n'];
     for (const obs of observations.slice(0, limit)) {
       const date = obs.created_at?.slice(0, 10) || '';
@@ -599,6 +634,7 @@ export class SearchRoutes extends BaseRouteHandler {
    */
   private searchArgsFromRequest(req: Request): Record<string, any> {
     const searchArgs: Record<string, any> = { ...(req.query as Record<string, any>) };
+    SearchRoutes.assertValidDateBounds(searchArgs);
     const platformSource = this.getOptionalPlatformSourceFromRequest(req);
     if (platformSource) {
       searchArgs.platformSource = platformSource;
@@ -609,7 +645,54 @@ export class SearchRoutes extends BaseRouteHandler {
     } else {
       delete searchArgs.projects;
     }
+    SearchRoutes.assertValidPagination(searchArgs);
     return searchArgs;
+  }
+
+  /**
+   * Reject an unparseable date bound up front. Left alone it reaches the search
+   * strategies, where it matches nothing on the SQLite path and filters nothing
+   * on the Chroma path, and the strategies' own error handling would swallow it.
+   */
+  private static assertValidDateBounds(searchArgs: Record<string, any>): void {
+    for (const [keys, boundary] of [
+      [['dateStart', 'date_start', 'date_from'], 'start'],
+      [['dateEnd', 'date_end', 'date_to'], 'end'],
+    ] as const) {
+      for (const key of keys) {
+        const value = searchArgs[key];
+        if (value === undefined || value === '') continue;
+        if (typeof value !== 'string') {
+          throw new AppError(`${key} must be a single date string`, 400, 'INVALID_DATE');
+        }
+        resolveDateBound(value, boundary);
+      }
+    }
+  }
+
+  /**
+   * `limit` and `offset` come straight from the query string and reach SQLite's
+   * LIMIT/OFFSET: `limit=-1` returned every row and `limit=abc` became NaN
+   * (no results). Accept only digits, with `limit >= 1`, like /api/logs does
+   * for `lines`; an empty value counts as absent.
+   */
+  private static assertValidPagination(searchArgs: Record<string, any>): void {
+    for (const [key, minimum] of [['limit', 1], ['offset', 0]] as const) {
+      const value = searchArgs[key];
+      if (value === undefined || value === '') {
+        delete searchArgs[key];
+        continue;
+      }
+      const parsed = typeof value === 'string' && /^\d+$/.test(value) ? Number(value) : NaN;
+      if (!Number.isSafeInteger(parsed) || parsed < minimum) {
+        throw new AppError(
+          `${key} must be ${minimum === 1 ? 'a positive' : 'a non-negative'} integer`,
+          400,
+          'INVALID_PAGINATION'
+        );
+      }
+      searchArgs[key] = String(parsed);
+    }
   }
 
   /**

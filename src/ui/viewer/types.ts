@@ -90,7 +90,8 @@ export interface Settings {
   CLAUDE_MEM_WORKER_PORT: string;
   CLAUDE_MEM_WORKER_HOST: string;
 
-  CLAUDE_MEM_PROVIDER?: string;  
+  CLAUDE_MEM_PROVIDER?: string;
+  CLAUDE_MEM_CLAUDE_AUTH_METHOD?: string;
   CLAUDE_MEM_CODEX_MODEL?: string;
   CLAUDE_MEM_GEMINI_API_KEY?: string;
   CLAUDE_MEM_GEMINI_API_KEYS?: string;
@@ -126,4 +127,6 @@ export interface Settings {
 
   /** File/env only — shown read-only. Not written via POST /api/settings. */
   CLAUDE_CODE_PATH?: string;
+  /** Written by `npx claude-mem teambrain join`; read-only here. Set once this install is in a team. */
+  CLAUDE_MEM_TEAMBRAIN_URL?: string;
 }

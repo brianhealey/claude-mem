@@ -89,6 +89,8 @@ export interface ObservationSearchInput {
   // predate it have left the agent's context, so they are returned.
   excludeContentSessionSince?: string | null;
   excludeKinds?: string[] | null;
+  /** Select summaries (true) or observations (false); omit for both. */
+  summary?: boolean;
 }
 
 export class PostgresObservationRepository {
@@ -264,6 +266,7 @@ export class PostgresObservationRepository {
           AND server_sessions.team_id = observations.team_id
         WHERE observations.project_id = $1
           AND observations.team_id = $2
+          AND ($12::boolean IS NULL OR (observations.kind = 'summary') = $12)
           AND (
             $3::text IS NULL
             OR observations.content_search @@ websearch_to_tsquery('english', $3)
@@ -366,6 +369,7 @@ export class PostgresObservationRepository {
         input.excludeContentSessionId || null,
         input.excludeKinds && input.excludeKinds.length > 0 ? input.excludeKinds : null,
         input.excludeContentSessionSince || null,
+        input.summary ?? null,
       ]
     );
     return result.rows.map(mapObservationRow);
