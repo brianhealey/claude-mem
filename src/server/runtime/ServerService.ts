@@ -19,7 +19,7 @@ import {
 } from '../../supervisor/process-registry.js';
 import { sanitizeEnv } from '../../supervisor/env-sanitizer.js';
 import { killProcessTree } from '../../shared/kill-process-tree.js';
-import { ServerV1PostgresRoutes } from '../routes/v1/ServerV1PostgresRoutes.js';
+import { KEYS_MANAGE_SCOPE, ServerV1PostgresRoutes } from '../routes/v1/ServerV1PostgresRoutes.js';
 import { SessionsObservationsAdapter } from '../compat/SessionsObservationsAdapter.js';
 import { SessionsSummarizeAdapter } from '../compat/SessionsSummarizeAdapter.js';
 import { ActiveServerQueueManager } from './ActiveServerQueueManager.js';
@@ -65,11 +65,12 @@ export interface ServerRuntimeState {
  * (search, save, delete, retry, minting a key) was refused as "CORS not
  * allowed".
  *
- * A policy also turns on the Host check, which refuses any DNS name the
- * operator has not named. So one is built only when the operator has named the
- * server, through CLAUDE_MEM_PUBLIC_URL or CLAUDE_MEM_ALLOWED_ORIGINS; a
- * deployment that sets neither keeps accepting whatever Host reaches it.
- * Read from the environment only, like the rest of the server's config.
+ * The policy is applied to CORS only (Server's corsPolicy), never to the
+ * worker's Host check: a deployment that sets CLAUDE_MEM_PUBLIC_URL for the MCP
+ * link must keep accepting hooks that reach it by an internal or proxy name.
+ * Built only when the operator has named the server, through
+ * CLAUDE_MEM_PUBLIC_URL or CLAUDE_MEM_ALLOWED_ORIGINS. Read from the
+ * environment only, like the rest of the server's config.
  */
 export function serverOriginPolicyFromEnv(env: NodeJS.ProcessEnv = process.env): WorkerOriginPolicy | undefined {
   const publicUrl = (env.CLAUDE_MEM_PUBLIC_URL ?? '').trim();
@@ -155,7 +156,7 @@ export class ServerService {
       // #2572 — server runtime is reachable over the network in Docker, so it
       // emits hardening headers (the worker, loopback-only, does not).
       securityHeaders: true,
-      originPolicy: serverOriginPolicyFromEnv(),
+      corsPolicy: serverOriginPolicyFromEnv(),
       getInitializationComplete: () => this.graph.postgres.bootstrap.initialized,
       getMcpReady: () => true,
       onShutdown: () => this.stop(),
@@ -471,6 +472,7 @@ export async function runServerServiceCli(argv: string[] = process.argv.slice(2)
       console.error('  restart          stop then start (daemon)');
       console.error('  status           print runtime status');
       console.error('  server api-key create|list|revoke|migrate-scopes   manage Postgres API keys');
+      console.error('  server api-key create --admin                      key that can also manage keys and read the audit trail');
       console.error('  server keys                                        alias for api-key list --active (no secrets)');
       console.error('  server jobs [list|inspect <id>]                    list/inspect generation jobs');
       process.exit(1);
@@ -559,10 +561,15 @@ export async function runServerApiKeyCli(argv: string[]): Promise<void> {
 
   try {
     if (sub === 'create') {
-      const scopes = (options.scope ?? options.scopes ?? 'memories:read')
+      const requested = (options.scope ?? options.scopes ?? 'memories:read')
         .split(',')
         .map((scope: string) => scope.trim())
         .filter(Boolean);
+      // --admin: the key the dashboard's Keys and Audit tabs need. The only
+      // way keys:manage is granted; POST /v1/keys never mints it.
+      const scopes = options.admin
+        ? [...new Set([...requested, ...ADMIN_SERVER_KEY_SCOPES])]
+        : requested;
       // Resolve team/project. If the caller passed --team/--project, honor
       // them. Otherwise, run the server bootstrap to get-or-create the
       // local team+project, then create a NEW key against those IDs with
@@ -693,6 +700,7 @@ export async function runServerApiKeyCli(argv: string[]): Promise<void> {
 // working default (or an explicit --scope list). Defaults to the same
 // read+write memory scopes the v1 routes require.
 const DEFAULT_SERVER_KEY_SCOPES = ['memories:read', 'memories:write'];
+const ADMIN_SERVER_KEY_SCOPES = [...DEFAULT_SERVER_KEY_SCOPES, KEYS_MANAGE_SCOPE];
 
 export async function migrateServerPostgresApiKeyScopes(argv: string[]): Promise<void> {
   const id = argv[0] && !argv[0].startsWith('--') ? argv[0] : undefined;
@@ -810,6 +818,7 @@ interface CliFlagValues {
   offset?: string;
   status?: string;
   active?: boolean;
+  admin?: boolean;
 }
 
 function parseFlagArgs(argv: string[]): CliFlagValues {
@@ -825,6 +834,7 @@ function parseFlagArgs(argv: string[]): CliFlagValues {
       offset: { type: 'string' },
       status: { type: 'string' },
       active: { type: 'boolean' },
+      admin: { type: 'boolean' },
     },
     strict: false,
     allowPositionals: true,

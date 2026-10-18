@@ -69,7 +69,19 @@ Set `CLAUDE_MEM_AUTH_MODE=api-key` and send `Authorization: Bearer <key>` on eve
 request. Scopes gate access:
 
 - **Read** endpoints (search, context, recall, usage) require `memories:read`.
-- **Write** endpoints (ingest, key issuance, deletion) require `memories:write`.
+- **Write** endpoints (ingest, editing, deletion, job retries) require `memories:write`.
+- **Key management and the audit trail** (`/v1/keys`, `/v1/audit`) require
+  `keys:manage`. Hook keys never carry it, so a key copied off one machine can't
+  list, revoke or mint keys, or read other people's searches. Only the server CLI
+  grants it:
+
+  ```bash
+  # inside the server container
+  bun /opt/claude-mem/scripts/server-service.cjs server api-key create --admin --name "operator"
+  ```
+
+  `--admin` adds `memories:read`, `memories:write` and `keys:manage` to any
+  `--scope` list you pass.
 
 Keys are stored as SHA-256 hashes in the `api_keys` table; the raw `cm_...` value
 is shown exactly once, at mint time.
@@ -107,15 +119,19 @@ is written to `audit_log` as an `observation.read` event, the same as
 
 Two routes turn "I have a server" into "Claude Code is recalling my cloud memory":
 
-- **`POST /v1/keys`** (requires `memories:write`) mints a **read-only** API key for
-  the caller's team and returns a paste-ready connect command. The raw key appears
-  **once**. Body: `{ "expiresInDays"?: number }`. Minting requires write scope so a
-  read-only key can't escalate itself into more keys.
+- **`POST /v1/keys`** (requires `keys:manage`) mints an API key for the caller's
+  team and returns a paste-ready connect command. The raw key appears **once**.
+  Body: `{ "label"?: string, "expiresInDays"?: number, "scopes"?: string[] }`.
+  `scopes` defaults to `["memories:read"]`; pass
+  `["memories:read", "memories:write"]` for a key that can also capture. A key
+  can grant only scopes it holds, and never `keys:manage`, which only the server
+  CLI grants.
 
   ```json
   {
     "id": "...",
     "apiKey": "cm_...",
+    "label": "laptop recall",
     "scopes": ["memories:read"],
     "expiresAt": null,
     "mcpUrl": "https://<host>/v1/mcp",
@@ -129,12 +145,13 @@ Two routes turn "I have a server" into "Claude Code is recalling my cloud memory
   failing that, the request host.
 
 <Warning>
-**First-key bootstrap is the rough edge.** Minting a team's *very first* key still
-needs a session-gated path (a web dashboard), because `POST /v1/keys` itself
-requires a write-scoped key. better-auth's `apiKey()` plugin exists but writes to
-a different store than the Postgres `api_keys` these routes authenticate against —
-wiring the better-auth org → team mapping is the remaining piece, and the biggest
-part of the devex work still ahead.
+**First-key bootstrap is the rough edge.** There is a dashboard, but signing in to
+it takes a key, and `POST /v1/keys` itself requires `keys:manage`. So a team's
+*very first* key comes from the server CLI (`server api-key create --admin`).
+better-auth's `apiKey()` plugin exists but writes to a different store than the
+Postgres `api_keys` these routes authenticate against — wiring the better-auth
+org → team mapping is the remaining piece, and the biggest part of the devex work
+still ahead.
 </Warning>
 
 ## Dashboard
@@ -149,15 +166,16 @@ exactly what that key can reach and nothing more.
 | **Sessions** | List sessions; open one to see its summary and a timeline of captured events, each with the memories generated from it and its raw payload on request. | `memories:read` |
 | **Pipeline** | Job counts by status, the provider and model last used, median capture-to-memory time, token and memory usage, per-lane queue depth, failed jobs grouped by reason, retry one or all. | `memories:read` (retry needs `memories:write`) |
 | **Value** | What memory costs against what it plausibly saves: tokens spent generating (measured), tokens handed back to agents and the raw tool output those memories stand in for (both estimated from text length), per day, with compression, recall counts, how many searches, session-start context reads and prompt lookups came back empty, how many memories handed over unasked were later searched for, and the most-recalled memories. | `memories:read` |
-| **Keys** | List the team's keys with their label and when each was last used, create a read-only or read-and-write key, revoke a key. | `memories:write` |
-| **Audit** | The team's audit trail: reads and searches, memories written, edited and deleted, keys created and revoked, jobs retried. | `memories:write` |
+| **Keys** | List the team's keys with their label and when each was last used, create a read-only or read-and-write key, revoke a key. | `keys:manage` |
+| **Audit** | The team's audit trail: reads and searches, memories written, edited and deleted, keys created and revoked, jobs retried. | `keys:manage` |
 
 <Warning>
 Set `CLAUDE_MEM_PUBLIC_URL` (or `CLAUDE_MEM_ALLOWED_ORIGINS`) to the address
 people open the dashboard at. The server refuses browser requests from any
 origin it has not been told about, so without it the page loads but every
-search, save, delete and retry fails with `CORS not allowed`. Naming the server
-this way also makes it refuse requests whose `Host` is some other DNS name.
+search, save, delete and retry fails with `CORS not allowed`. This only sets
+which browser origins may call the server: hooks and proxies that reach it by an
+internal name keep working.
 </Warning>
 
 <Note>
@@ -178,11 +196,13 @@ rows).
 The usage figures on the Pipeline and Value tabs come from `usage_events`, which the
 generation worker only writes when it runs with `CLAUDE_MEM_USAGE_METERING=1`.
 
-`/v1/search` matches on the full-text index and also on a plain substring, so a
-word inside a file name such as `registries.yaml` is found; substring-only
-matches rank after full-text hits. A query of several words that fewer than
-three memories match whole is widened: memories holding at least half of its
-terms (four are always enough) are added after the whole matches. This is still
+`/v1/search` matches on the full-text index and, for queries of up to 128
+characters, also on a plain substring, so a word inside a file name such as
+`registries.yaml` is found; substring-only matches rank after full-text hits. A
+query of several words that fewer than three memories match whole is widened:
+memories holding at least half of its terms (four are always enough) are added
+after the whole matches. A query of more than eight words, such as a prompt, goes
+straight to the widened search, still ranking whole matches first. This is still
 term matching, not semantic search.
 
 With `CLAUDE_MEM_SEMANTIC_INJECT=true` in the client's settings, the prompt hook
@@ -195,9 +215,18 @@ out itself: what `/v1/context` returns and records is then exactly what was
 injected, and the Value tab does not count a lookup that only found the
 session's own work as a recall.
 
+`<private>` sections are removed from the prompt before it leaves the client,
+and the server strips them again, so they are never searched for or stored in
+the audit trail. A prompt with too little left after that gets no lookup, and
+neither do prompts recorded by the transcript watcher, whose result is never
+injected. `CLAUDE_MEM_SEMANTIC_INJECT_FORMAT=index` has no effect in server
+runtime: an index points the agent at `get_observations`, which cannot resolve
+server memory ids, so the hook always injects the memories themselves.
+
 A compaction removes the session's earlier work from the agent's context, so
 after one the hook also passes `excludeContentSessionSince`, the time of the
-last compaction. The server then leaves out only the session's memories from
+last compaction (recorded by `SessionStart` after a compaction, and by Codex's
+`PostCompact` for the main thread). The server then leaves out only the session's memories from
 after that time; those from before it can be injected, and count as recalls,
 like any other memory. A memory is dated by the events it was generated from.
 
@@ -206,10 +235,10 @@ agent unasked (at session start or with a prompt) that an agent's own search
 returned afterwards. It is the only sign of use the audit trail holds, and a
 lower bound: an agent can use a memory without searching for it.
 
-`POST /v1/keys` still mints a read-only key by default, and takes an optional
-`label`. Pass
-`{ "scopes": ["memories:read", "memories:write"] }` to mint one that can also
-capture. `DELETE /v1/keys/:id` revokes a key; a key cannot revoke itself.
+**Retry all** on the Pipeline tab asks for a second click naming how many jobs it
+will requeue, since each one is another provider call. Jobs that failed because
+their key was revoked or their scope did not match are left alone: a retry would
+fail the same way.
 
 ## Paid-readiness: rate limiting, quotas, metering
 
@@ -305,8 +334,10 @@ provider call; it does not guarantee exactly-once provider execution.
 Three things keep the worker from making one provider call per tool call.
 
 **Skipped tools.** Events from navigation and bookkeeping tools (`Glob`, `LS`,
-`ToolSearch`, `TodoWrite`, the task-list tools, and Serena's overview and
-memory-reading tools) are stored but get no generation job. Set
+`ToolSearch`, `ScheduleWakeup`, the task-list tools, and Serena's overview and
+memory-reading tools) are stored but get no generation job. `TodoWrite` and
+`ListMcpResourcesTool` are already dropped by the hook's `CLAUDE_MEM_SKIP_TOOLS`,
+so they never reach the server. Set
 `CLAUDE_MEM_SERVER_GENERATION_SKIP_TOOLS` on the **server** to a comma-separated
 list of tool names to replace the default list, or to an empty string to
 generate for every tool.
@@ -381,10 +412,10 @@ GET    /v1/jobs                   # generation jobs (status, limit, offset)
 GET    /v1/jobs/summary           # job counts, failures by reason, last provider, latency
 POST   /v1/jobs/:id/retry
 POST   /v1/jobs/retry-failed      # requeue all failed jobs, optionally for one reason
-POST   /v1/keys                   # mint a key (write scope); read-only by default
-GET    /v1/keys                   # list the team's keys, metadata only (write scope)
-DELETE /v1/keys/:id               # revoke a key (write scope)
-GET    /v1/audit                  # the team's audit trail (write scope; limit, offset, action)
+POST   /v1/keys                   # mint a key (keys:manage); read-only by default
+GET    /v1/keys                   # list the team's keys, metadata only (keys:manage)
+DELETE /v1/keys/:id               # revoke a key; not the caller's own (keys:manage)
+GET    /v1/audit                  # the team's audit trail (keys:manage; limit, offset, action)
 GET    /v1/connect                # connect command with key placeholder
 GET    /v1/usage                  # usage totals for this month and today
 GET    /v1/value?projectId=       # daily cost and estimated savings of recall (days=7..90)

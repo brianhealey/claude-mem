@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 //
 // The read and operator routes the hosted-server dashboard is built on:
-// GET /v1/whoami, GET/DELETE /v1/keys, write-scoped minting on POST /v1/keys,
+// GET /v1/whoami, GET/DELETE /v1/keys and minting on POST /v1/keys (all three
+// behind keys:manage, which hook keys never carry), GET /v1/audit,
 // GET /v1/projects, GET /v1/sessions, GET /v1/memories and GET /v1/jobs/summary.
 // Postgres-gated.
 //
@@ -42,6 +43,8 @@ describe('dashboard routes', () => {
   let projectId: string;
   let writeKey: string;
   let writeKeyId: string;
+  let adminKey: string;
+  let adminKeyId: string;
   let readKey: string;
   let readKeyId: string;
   let otherTeamKey: string;
@@ -67,11 +70,13 @@ describe('dashboard routes', () => {
     writeKeyId = (await storage.auth.createApiKey({ keyHash: w.hash, teamId, projectId, actorId: 't', scopes: ['memories:read', 'memories:write'] })).id;
     const r = newApiKey(); readKey = r.raw;
     readKeyId = (await storage.auth.createApiKey({ keyHash: r.hash, teamId, projectId, actorId: 't', scopes: ['memories:read'] })).id;
+    const a = newApiKey(); adminKey = a.raw;
+    adminKeyId = (await storage.auth.createApiKey({ keyHash: a.hash, teamId, projectId, actorId: 't', scopes: ['memories:read', 'memories:write', 'keys:manage'] })).id;
 
     const otherTeam = await storage.teams.create({ name: 'other' });
     const otherProject = await storage.projects.create({ teamId: otherTeam.id, name: 'other-project' });
     const o = newApiKey(); otherTeamKey = o.raw;
-    otherTeamKeyId = (await storage.auth.createApiKey({ keyHash: o.hash, teamId: otherTeam.id, projectId: otherProject.id, actorId: 't', scopes: ['memories:read', 'memories:write'] })).id;
+    otherTeamKeyId = (await storage.auth.createApiKey({ keyHash: o.hash, teamId: otherTeam.id, projectId: otherProject.id, actorId: 't', scopes: ['memories:read', 'memories:write', 'keys:manage'] })).id;
 
     server = new Server({
       getInitializationComplete: () => true, getMcpReady: () => true,
@@ -115,14 +120,14 @@ describe('dashboard routes', () => {
   });
 
   it('GET /v1/keys lists only this team\'s keys, without key material', async () => {
-    const r = await call('GET', '/v1/keys', writeKey);
+    const r = await call('GET', '/v1/keys', adminKey);
     expect(r.status).toBe(200);
     const raw = await r.text();
     expect(raw).not.toContain('keyHash');
     expect(raw).not.toContain('key_hash');
     const { keys } = JSON.parse(raw) as { keys: Array<{ id: string; status: string; current: boolean; scopes: string[] }> };
-    expect(keys.map(k => k.id).sort()).toEqual([writeKeyId, readKeyId].sort());
-    expect(keys.find(k => k.id === writeKeyId)?.current).toBe(true);
+    expect(keys.map(k => k.id).sort()).toEqual([writeKeyId, readKeyId, adminKeyId].sort());
+    expect(keys.find(k => k.id === adminKeyId)?.current).toBe(true);
     expect(keys.find(k => k.id === readKeyId)?.current).toBe(false);
     expect(keys.every(k => k.status === 'active')).toBe(true);
   });
@@ -132,36 +137,57 @@ describe('dashboard routes', () => {
     expect([401, 403]).toContain((await call('DELETE', `/v1/keys/${writeKeyId}`, readKey)).status);
   });
 
+  it('a write key without keys:manage (a hook key) cannot manage keys or read the audit trail', async () => {
+    expect((await call('GET', '/v1/keys', writeKey)).status).toBe(403);
+    expect((await call('DELETE', `/v1/keys/${adminKeyId}`, writeKey)).status).toBe(403);
+    expect((await call('POST', '/v1/keys', writeKey, {})).status).toBe(403);
+    expect((await call('POST', '/v1/keys', writeKey, { scopes: ['memories:read', 'memories:write'] })).status).toBe(403);
+    expect((await call('GET', '/v1/audit', writeKey)).status).toBe(403);
+    // The admin key it tried to revoke still works.
+    expect((await call('GET', '/v1/whoami', adminKey)).status).toBe(200);
+  });
+
+  it('POST /v1/keys grants only scopes the caller holds, and never keys:manage', async () => {
+    const k = newApiKey();
+    await storage.auth.createApiKey({ keyHash: k.hash, teamId, projectId, actorId: 't', scopes: ['memories:read', 'keys:manage'] });
+    const refused = await call('POST', '/v1/keys', k.raw, { scopes: ['memories:read', 'memories:write'] });
+    expect(refused.status).toBe(403);
+    expect((await refused.json() as { message: string }).message).toContain('memories:write');
+    expect((await call('POST', '/v1/keys', k.raw, { scopes: ['memories:read'] })).status).toBe(201);
+    // An admin key minted by the CLI cannot be copied through the API.
+    expect((await call('POST', '/v1/keys', adminKey, { scopes: ['keys:manage'] })).status).toBe(400);
+  });
+
   it('DELETE /v1/keys/:id revokes a key, which then stops authenticating', async () => {
     expect((await call('GET', '/v1/whoami', readKey)).status).toBe(200);
-    const r = await call('DELETE', `/v1/keys/${readKeyId}`, writeKey);
+    const r = await call('DELETE', `/v1/keys/${readKeyId}`, adminKey);
     expect(r.status).toBe(200);
     expect(await r.json()).toEqual({ revoked: true, id: readKeyId });
     expect((await call('GET', '/v1/whoami', readKey)).status).toBe(403);
 
-    const { keys } = await (await call('GET', '/v1/keys', writeKey)).json() as { keys: Array<{ id: string; status: string }> };
+    const { keys } = await (await call('GET', '/v1/keys', adminKey)).json() as { keys: Array<{ id: string; status: string }> };
     expect(keys.find(k => k.id === readKeyId)?.status).toBe('revoked');
     // Revoking again is a no-op, not an error.
-    expect((await call('DELETE', `/v1/keys/${readKeyId}`, writeKey)).status).toBe(200);
+    expect((await call('DELETE', `/v1/keys/${readKeyId}`, adminKey)).status).toBe(200);
   });
 
   it('a key cannot revoke itself, another team\'s key, or an unknown key', async () => {
-    expect((await call('DELETE', `/v1/keys/${writeKeyId}`, writeKey)).status).toBe(409);
-    expect((await call('DELETE', `/v1/keys/${otherTeamKeyId}`, writeKey)).status).toBe(404);
-    expect((await call('DELETE', '/v1/keys/no-such-key', writeKey)).status).toBe(404);
+    expect((await call('DELETE', `/v1/keys/${adminKeyId}`, adminKey)).status).toBe(409);
+    expect((await call('DELETE', `/v1/keys/${otherTeamKeyId}`, adminKey)).status).toBe(404);
+    expect((await call('DELETE', '/v1/keys/no-such-key', adminKey)).status).toBe(404);
     // The other team's key is untouched.
     expect((await call('GET', '/v1/whoami', otherTeamKey)).status).toBe(200);
   });
 
   it('POST /v1/keys can mint a write key, and still defaults to read-only', async () => {
-    const minted = await (await call('POST', '/v1/keys', writeKey, { scopes: ['memories:read', 'memories:write'] })).json() as { apiKey: string; scopes: string[] };
+    const minted = await (await call('POST', '/v1/keys', adminKey, { scopes: ['memories:read', 'memories:write'] })).json() as { apiKey: string; scopes: string[] };
     expect(minted.scopes).toEqual(['memories:read', 'memories:write']);
     const write = await call('POST', '/v1/memories', minted.apiKey, { projectId, content: 'written with a minted key' });
     expect(write.status).toBe(201);
 
-    const defaulted = await (await call('POST', '/v1/keys', writeKey, {})).json() as { scopes: string[] };
+    const defaulted = await (await call('POST', '/v1/keys', adminKey, {})).json() as { scopes: string[] };
     expect(defaulted.scopes).toEqual(['memories:read']);
-    expect((await call('POST', '/v1/keys', writeKey, { scopes: ['admin'] })).status).toBe(400);
+    expect((await call('POST', '/v1/keys', adminKey, { scopes: ['admin'] })).status).toBe(400);
   });
 
   it('GET /v1/projects lists the key\'s project with its observation count', async () => {
@@ -282,10 +308,10 @@ describe('dashboard routes', () => {
   });
 
   it('keys carry a label and record when they were last used', async () => {
-    const minted = await (await call('POST', '/v1/keys', writeKey, { label: '  laptop recall ' })).json() as { id: string; apiKey: string; label: string };
+    const minted = await (await call('POST', '/v1/keys', adminKey, { label: '  laptop recall ' })).json() as { id: string; apiKey: string; label: string };
     expect(minted.label).toBe('laptop recall');
     type Listed = { keys: Array<{ id: string; label: string | null; lastUsedAtEpoch: number | null }> };
-    const before = await (await call('GET', '/v1/keys', writeKey)).json() as Listed;
+    const before = await (await call('GET', '/v1/keys', adminKey)).json() as Listed;
     expect(before.keys.find(k => k.id === minted.id)).toMatchObject({ label: 'laptop recall', lastUsedAtEpoch: null });
 
     expect((await call('GET', '/v1/whoami', minted.apiKey)).status).toBe(200);
@@ -293,7 +319,7 @@ describe('dashboard routes', () => {
     let used: number | null = null;
     for (let i = 0; i < 40 && used === null; i += 1) {
       await new Promise(resolve => setTimeout(resolve, 25));
-      const now = await (await call('GET', '/v1/keys', writeKey)).json() as Listed;
+      const now = await (await call('GET', '/v1/keys', adminKey)).json() as Listed;
       used = now.keys.find(k => k.id === minted.id)?.lastUsedAtEpoch ?? null;
     }
     expect(used).not.toBeNull();
@@ -350,23 +376,24 @@ describe('dashboard routes', () => {
     expect(audits.rows[0].n).toBe(2);
   });
 
-  it('GET /v1/audit lists the team\'s trail to write keys only', async () => {
+  it('GET /v1/audit lists the team\'s trail to admin keys only', async () => {
     const created = await storage.observations.create({ projectId, teamId, content: 'to be deleted' });
     await call('POST', '/v1/search', readKey, { projectId, query: 'deleted' });
     await call('DELETE', `/v1/memories/${created.id}`, writeKey);
     type Trail = { entries: Array<{ action: string; resourceId: string | null; apiKeyId: string; details: Record<string, unknown> }>; hasMore: boolean };
-    const trail = await (await call('GET', '/v1/audit', writeKey)).json() as Trail;
+    const trail = await (await call('GET', '/v1/audit', adminKey)).json() as Trail;
     expect(trail.entries.map(e => e.action)).toEqual(['observation.deleted', 'observation.read']);
     expect(trail.entries[0]).toMatchObject({ resourceId: created.id, apiKeyId: writeKeyId });
     expect(trail.entries[1]).toMatchObject({ apiKeyId: readKeyId, details: { mode: 'search', query: 'deleted' } });
 
-    const onlyDeletes = await (await call('GET', '/v1/audit?action=observation.deleted', writeKey)).json() as Trail;
+    const onlyDeletes = await (await call('GET', '/v1/audit?action=observation.deleted', adminKey)).json() as Trail;
     expect(onlyDeletes.entries).toHaveLength(1);
-    const paged = await (await call('GET', '/v1/audit?limit=1', writeKey)).json() as Trail;
+    const paged = await (await call('GET', '/v1/audit?limit=1', adminKey)).json() as Trail;
     expect(paged.entries).toHaveLength(1);
     expect(paged.hasMore).toBe(true);
 
     expect([401, 403]).toContain((await call('GET', '/v1/audit', readKey)).status);
+    expect((await call('GET', '/v1/audit', writeKey)).status).toBe(403);
     // The other team sees none of it.
     expect((await (await call('GET', '/v1/audit', otherTeamKey)).json() as Trail).entries).toHaveLength(0);
   });
@@ -528,7 +555,7 @@ describe('dashboard routes', () => {
   });
 
   describe('failed jobs', () => {
-    const seedFailedJob = async (reason: string) => {
+    const seedFailedJob = async (reason: string, classification?: string) => {
       const event = await storage.agentEvents.create({
         projectId, teamId, sourceAdapter: 'api', eventType: 'tool_use', payload: { n: randomUUID() }, occurredAt: new Date(),
       });
@@ -540,7 +567,7 @@ describe('dashboard routes', () => {
         `UPDATE observation_generation_jobs
             SET status = 'failed', failed_at = now(), attempts = max_attempts, last_error = $2::jsonb
           WHERE id = $1`,
-        [job.id, JSON.stringify({ reason })],
+        [job.id, JSON.stringify({ reason, ...(classification ? { classification } : {}) })],
       );
       return job.id;
     };
@@ -587,6 +614,18 @@ describe('dashboard routes', () => {
       // The other team's key requeues nothing of ours.
       await seedFailedJob('again');
       expect(await (await call('POST', '/v1/jobs/retry-failed', otherTeamKey, {})).json()).toMatchObject({ requeued: 0 });
+    });
+
+    it('POST /v1/jobs/retry-failed leaves jobs a retry cannot fix', async () => {
+      const revoked = await seedFailedJob('api key is revoked', 'revoked_key');
+      const mismatch = await seedFailedJob('payload does not match', 'scope_mismatch');
+      const transient = await seedFailedJob('upstream 503', 'transient');
+      expect(await (await call('POST', '/v1/jobs/retry-failed', writeKey, {})).json()).toMatchObject({ requeued: 1 });
+      const statuses = await client.query<{ id: string; status: string }>(
+        'SELECT id, status FROM observation_generation_jobs WHERE id = ANY($1)', [[revoked, mismatch, transient]]);
+      expect(Object.fromEntries(statuses.rows.map(row => [row.id, row.status]))).toEqual({
+        [revoked]: 'failed', [mismatch]: 'failed', [transient]: 'queued',
+      });
     });
   });
 });

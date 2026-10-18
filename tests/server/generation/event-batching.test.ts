@@ -46,6 +46,54 @@ class RecordingProvider implements ServerGenerationProvider {
   }
 }
 
+// Runs a step (e.g. another worker taking a lock) while the call is in flight.
+class HookedProvider extends RecordingProvider {
+  constructor(response: string | Error, private readonly onGenerate: () => Promise<void>) {
+    super(response);
+  }
+
+  override async generate(context: ServerGenerationContext) {
+    await this.onGenerate();
+    return super.generate(context);
+  }
+}
+
+function recordingQueue() {
+  const added: { jobId: string; options?: { delay?: number } }[] = [];
+  const removed: string[] = [];
+  return {
+    added,
+    removed,
+    queue: {
+      add: async (jobId: string, _payload: never, options?: { delay?: number }) => {
+        added.push({ jobId, options });
+      },
+      remove: async (jobId: string) => {
+        removed.push(jobId);
+      },
+    },
+  };
+}
+
+describe('already-recorded titles', () => {
+  it('are character data, so quotes stay as written', () => {
+    const job = {
+      id: 'job-1', projectId: 'p', teamId: 't', agentEventId: 'e', sourceType: 'agent_event' as const,
+      sourceId: 'e', serverSessionId: 's', jobType: 'observation_generate_for_event', status: 'processing' as const,
+      idempotencyKey: 'k', bullmqJobId: null, attempts: 1, maxAttempts: 3, nextAttemptAtEpoch: null,
+      lockedAtEpoch: null, lockedBy: null, completedAtEpoch: null, failedAtEpoch: null, cancelledAtEpoch: null,
+      lastError: null, payload: {}, createdAtEpoch: 0, updatedAtEpoch: 0,
+    };
+    const prompt = buildServerGenerationPrompt({
+      job,
+      events: [],
+      project: { projectId: 'p', teamId: 't', serverSessionId: 's', projectName: 'demo' },
+      recordedTitles: [`Fixed "quoted" & it's <done>`],
+    } as ServerGenerationContext).prompt;
+    expect(prompt).toContain(`<title>Fixed "quoted" &amp; it's &lt;done&gt;</title>`);
+  });
+});
+
 describe('generation skip list', () => {
   it('skips navigation tools by default and generates for the rest', () => {
     const skip = resolveGenerationSkipTools({});
@@ -127,6 +175,7 @@ describe('event generation batching', () => {
       agentEventId: event.id,
       serverSessionId,
       jobType: 'observation_generate_for_event',
+      bullmqJobId: `bull-event-${index}`,
       payload: { api_key_id: options.apiKeyId ?? null },
     });
     return { event, job };
@@ -154,6 +203,14 @@ describe('event generation batching', () => {
     return storage.observationGenerationJobs
       .getByIdForScope({ id: jobId, projectId, teamId })
       .then(job => job?.status);
+  }
+
+  function rowOf(jobId: string) {
+    return storage.observationGenerationJobs.getByIdForScope({ id: jobId, projectId, teamId });
+  }
+
+  function takeLock(jobId: string) {
+    return pool.query(`UPDATE observation_generation_jobs SET locked_by = 'other-worker' WHERE id = $1`, [jobId]);
   }
 
   it('covers a session\'s queued event jobs with one provider call', async () => {
@@ -223,11 +280,85 @@ describe('event generation batching', () => {
     const provider = new RecordingProvider(
       new ServerClassifiedProviderError('rate limited', { kind: 'rate_limit', cause: null }),
     );
-    const generator = new ProviderObservationGenerator({ pool, provider });
+    const events = recordingQueue();
+    const generator = new ProviderObservationGenerator({ pool, provider, resolveEventQueue: () => events.queue });
 
     await expect(generator.process(bullJob(entries[0]!))).rejects.toThrow('rate limited');
 
     expect(await statusOf(entries[0]!.job.id)).toBe('queued');
+    expect(await statusOf(entries[1]!.job.id)).toBe('queued');
+    // The carrying job is retried by BullMQ; the batched one lost its own
+    // delivery, so it is republished, after the retry backoff.
+    expect(events.added.map(entry => entry.jobId)).toEqual(['bull-event-2']);
+    expect(events.removed).toEqual(['bull-event-2']);
+    expect(events.added[0]!.options?.delay).toBeGreaterThan(0);
+  });
+
+  it('fails a released batched job it cannot put back on the queue', async () => {
+    const entries = [await addEventJob(1), await addEventJob(2)];
+    const provider = new RecordingProvider(
+      new ServerClassifiedProviderError('rate limited', { kind: 'rate_limit', cause: null }),
+    );
+    const generator = new ProviderObservationGenerator({ pool, provider, resolveEventQueue: () => null });
+
+    await expect(generator.process(bullJob(entries[0]!))).rejects.toThrow('rate limited');
+
+    expect(await statusOf(entries[0]!.job.id)).toBe('queued');
+    const sibling = await rowOf(entries[1]!.job.id);
+    expect(sibling?.status).toBe('failed');
+    expect(sibling?.lastError).toMatchObject({ reason: 'batch_requeue_unpublished' });
+  });
+
+  it('republishes the batched jobs when the carrying attempt is superseded', async () => {
+    const entries = [await addEventJob(1), await addEventJob(2)];
+    const provider = new HookedProvider(OBSERVATION_XML, () => takeLock(entries[0]!.job.id).then(() => {}));
+    const events = recordingQueue();
+    const generator = new ProviderObservationGenerator({ pool, provider, resolveEventQueue: () => events.queue });
+
+    const result = await generator.process(bullJob(entries[0]!));
+
+    expect(result.status).toBe('superseded');
+    expect(await storage.observations.listByProject({ projectId, teamId })).toHaveLength(0);
+    // The carrying job belongs to the other worker now and is left alone.
+    expect((await rowOf(entries[0]!.job.id))?.lockedBy).toBe('other-worker');
+    expect(await statusOf(entries[1]!.job.id)).toBe('queued');
+    expect(events.added.map(entry => entry.jobId)).toEqual(['bull-event-2']);
+  });
+
+  it('completes a batched job only while this attempt still owns its lock', async () => {
+    const entries = [await addEventJob(1), await addEventJob(2)];
+    const provider = new HookedProvider(OBSERVATION_XML, () => takeLock(entries[1]!.job.id).then(() => {}));
+    const events = recordingQueue();
+    const generator = new ProviderObservationGenerator({ pool, provider, resolveEventQueue: () => events.queue });
+
+    const result = await generator.process(bullJob(entries[0]!));
+
+    expect(result.observationCount).toBe(1);
+    expect(await statusOf(entries[0]!.job.id)).toBe('completed');
+    const sibling = await rowOf(entries[1]!.job.id);
+    expect(sibling?.status).toBe('processing');
+    expect(sibling?.lockedBy).toBe('other-worker');
+    const observations = await storage.observations.listByProject({ projectId, teamId });
+    const sources = await storage.observationSources.listByObservationForScope({
+      observationId: observations[0]!.id,
+      projectId,
+      teamId,
+    });
+    expect(sources.map(source => source.agentEventId)).toEqual([entries[0]!.event.id]);
+    expect(events.added).toEqual([]);
+  });
+
+  it('leaves a job waiting out a retry backoff out of the batch', async () => {
+    const entries = [await addEventJob(1), await addEventJob(2)];
+    await pool.query(
+      `UPDATE observation_generation_jobs SET next_attempt_at = now() + interval '1 hour' WHERE id = $1`,
+      [entries[1]!.job.id],
+    );
+    const provider = new RecordingProvider(OBSERVATION_XML);
+
+    await new ProviderObservationGenerator({ pool, provider }).process(bullJob(entries[0]!));
+
+    expect(provider.contexts[0]!.events).toHaveLength(1);
     expect(await statusOf(entries[1]!.job.id)).toBe('queued');
   });
 

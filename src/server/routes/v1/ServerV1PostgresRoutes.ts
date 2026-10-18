@@ -35,6 +35,7 @@ import { PostgresServerSessionsRepository } from '../../../storage/postgres/serv
 import { IngestEventsService, type EnqueueOutcome } from '../../services/IngestEventsService.js';
 import { EndSessionService } from '../../services/EndSessionService.js';
 import { normalizePlatformSource, normalizePlatformSourceOrNull } from '../../../shared/platform-source.js';
+import { stripMemoryTags } from '../../../utils/tag-stripping.js';
 import {
   SERVER_CONTEXT_MAX_LIMIT,
   SERVER_CONTEXT_QUERY_DEFAULT_LIMIT,
@@ -43,8 +44,14 @@ import {
 
 const SOURCE_ADAPTER_DEFAULT = 'api';
 
-// The scopes POST /v1/keys may grant. Minting requires memories:write, so
-// neither is more than the caller already has.
+// Managing keys and reading the audit trail. Every hook key carries
+// memories:write, so a leaked laptop key must not be able to list, revoke or
+// mint keys, or read other people's queries. Only the server CLI grants it
+// (`server api-key create --admin`).
+export const KEYS_MANAGE_SCOPE = 'keys:manage';
+
+// The scopes POST /v1/keys may grant, each only to a caller that holds it.
+// keys:manage is not among them: an admin key is minted by the server CLI.
 const MINTABLE_KEY_SCOPES = ['memories:read', 'memories:write'] as const;
 
 const MEMORY_LIST_DEFAULT_LIMIT = 50;
@@ -56,6 +63,9 @@ const SESSION_EVENT_LIST_MAX_LIMIT = 500;
 // How many recent completed jobs the capture-to-memory median is taken over.
 const JOB_LATENCY_SAMPLE_SIZE = 50;
 const BULK_RETRY_MAX_JOBS = 200;
+// Failure classifications a retry cannot fix (ProviderObservationGenerator's
+// scope and revocation checks).
+const PERMANENT_FAILURE_CLASSIFICATIONS = ['scope_mismatch', 'revoked_key'];
 const AUDIT_LIST_DEFAULT_LIMIT = 100;
 const AUDIT_LIST_MAX_LIMIT = 500;
 const VALUE_DEFAULT_DAYS = 30;
@@ -192,6 +202,11 @@ export class ServerV1PostgresRoutes implements RouteHandler {
       allowLocalDevBypass: this.options.allowLocalDevBypass,
       requiredScopes: ['memories:read'],
     });
+    const baseAdmin = requirePostgresServerAuth(this.options.pool, {
+      authMode: this.options.authMode,
+      allowLocalDevBypass: this.options.allowLocalDevBypass,
+      requiredScopes: [KEYS_MANAGE_SCOPE],
+    });
     // Paid-readiness guards, all opt-in via env so default behavior is unchanged
     // (empty array → readAuth/writeAuth are just the base auth). Express accepts
     // a middleware array wherever a single handler goes, so the per-route
@@ -210,6 +225,7 @@ export class ServerV1PostgresRoutes implements RouteHandler {
     if (tokenCap > 0) writeGuards.push(requireMonthlyQuota(this.options.pool, { kind: 'tokens', cap: tokenCap }));
     const writeAuth: RequestHandler[] = [baseWrite, ...writeGuards];
     const readAuth: RequestHandler[] = [baseRead, ...guards];
+    const adminAuth: RequestHandler[] = [baseAdmin, ...guards];
 
     // GET /v1/usage — per-kind usage totals for the caller's team this month.
     app.get('/v1/usage', readAuth, this.asyncHandler(async (req, res) => {
@@ -228,11 +244,10 @@ export class ServerV1PostgresRoutes implements RouteHandler {
 
     // POST /v1/keys — mint an optionally-expiring API key for the caller's team
     // and return the ready-to-paste connect command. READ-ONLY unless `scopes`
-    // asks for write as well. Gated by writeAuth: the caller can already write
-    // the team's memory, so a read or write key is never more than it holds,
-    // and a read key cannot escalate itself into more keys. The raw key is
-    // shown exactly once.
-    app.post('/v1/keys', writeAuth, this.handleCreate(
+    // asks for write as well. Gated by keys:manage, so a hook key cannot mint
+    // a key that outlives its own revocation, and each granted scope must be
+    // one the caller holds. The raw key is shown exactly once.
+    app.post('/v1/keys', adminAuth, this.handleCreate(
       z.object({
         label: z.string().max(120).optional(),
         expiresInDays: z.number().int().positive().max(365).optional(),
@@ -242,6 +257,17 @@ export class ServerV1PostgresRoutes implements RouteHandler {
         const teamId = this.requireTeamId(req, res);
         if (!teamId) return;
         const scopes = [...new Set(body.scopes ?? ['memories:read'])];
+        const held = req.authContext?.scopes ?? [];
+        const unheld = req.authContext?.mode === 'local-dev' || held.includes('*')
+          ? []
+          : scopes.filter(scope => !held.includes(scope));
+        if (unheld.length > 0) {
+          res.status(403).json({
+            error: 'Forbidden',
+            message: `A key cannot grant scopes it does not hold: ${unheld.join(', ')}`,
+          });
+          return;
+        }
         const raw = `cm_${randomBytes(24).toString('hex')}`;
         const keyHash = createHash('sha256').update(raw).digest('hex');
         const expiresAt = body.expiresInDays
@@ -279,7 +305,7 @@ export class ServerV1PostgresRoutes implements RouteHandler {
       res.status(200).json({
         mcpUrl,
         connectCommand: mcpConnectCommand(mcpUrl, '<YOUR_API_KEY>'),
-        hint: 'POST /v1/keys (write scope) to mint a read-only key for this link.',
+        hint: `POST /v1/keys (${KEYS_MANAGE_SCOPE} scope) to mint a read-only key for this link.`,
       });
     }));
 
@@ -299,9 +325,9 @@ export class ServerV1PostgresRoutes implements RouteHandler {
 
     // GET /v1/keys — the team's API keys, metadata only. key_hash is never
     // selected, so no response can carry key material. A project-scoped caller
-    // sees only that project's keys. writeAuth, like minting: a pasted
-    // read-only recall link must not be able to enumerate the team's keys.
-    app.get('/v1/keys', writeAuth, this.asyncHandler(async (req, res) => {
+    // sees only that project's keys. keys:manage, like minting: neither a
+    // pasted recall link nor a hook key may enumerate the team's keys.
+    app.get('/v1/keys', adminAuth, this.asyncHandler(async (req, res) => {
       const teamId = this.requireTeamId(req, res);
       if (!teamId) return;
       const projectScope = req.authContext?.projectId ?? null;
@@ -323,7 +349,7 @@ export class ServerV1PostgresRoutes implements RouteHandler {
     // DELETE /v1/keys/:id — revoke a key. Idempotent on an already-revoked key.
     // A key cannot revoke itself: that would lock the caller out mid-request
     // with no key left to undo it.
-    app.delete('/v1/keys/:id', writeAuth, this.asyncHandler(async (req, res) => {
+    app.delete('/v1/keys/:id', adminAuth, this.asyncHandler(async (req, res) => {
       const teamId = this.requireTeamId(req, res);
       if (!teamId) return;
       const id = this.routeParam(req.params.id);
@@ -697,9 +723,9 @@ export class ServerV1PostgresRoutes implements RouteHandler {
     }));
 
     // GET /v1/audit — the team's audit trail, newest first: who read, wrote,
-    // deleted or minted what. writeAuth, because the trail itself says what
+    // deleted or minted what. keys:manage, because the trail itself says what
     // was searched for and by which key.
-    app.get('/v1/audit', writeAuth, this.asyncHandler(async (req, res) => {
+    app.get('/v1/audit', adminAuth, this.asyncHandler(async (req, res) => {
       const teamId = this.requireTeamId(req, res);
       if (!teamId) return;
       const projectScope = req.authContext?.projectId ?? null;
@@ -1294,7 +1320,8 @@ export class ServerV1PostgresRoutes implements RouteHandler {
     // optionally only those that failed for one `reason`. For the morning after
     // a provider outage or an exhausted quota, when the failures number in the
     // dozens and share a cause. Capped per call; `remaining` says whether to
-    // call again.
+    // call again. A job refused for a revoked key or a scope mismatch fails
+    // the same way on every attempt, so the sweep leaves it alone.
     app.post('/v1/jobs/retry-failed', writeAuth, this.handleCreate(
       z.object({ reason: z.string().min(1).max(500).optional() }),
       async (req, res, body) => {
@@ -1307,10 +1334,11 @@ export class ServerV1PostgresRoutes implements RouteHandler {
             FROM observation_generation_jobs
             WHERE team_id = $1 AND ($2::text IS NULL OR project_id = $2) AND status = 'failed'
               AND ($3::text IS NULL OR last_error->>'reason' = $3)
+              AND COALESCE(last_error->>'classification', '') <> ALL($5::text[])
             ORDER BY failed_at ASC NULLS LAST, created_at ASC
             LIMIT $4
           `,
-          [teamId, projectScope, body.reason ?? null, BULK_RETRY_MAX_JOBS + 1],
+          [teamId, projectScope, body.reason ?? null, BULK_RETRY_MAX_JOBS + 1, PERMANENT_FAILURE_CLASSIFICATIONS],
         );
         const batch = failed.rows.slice(0, BULK_RETRY_MAX_JOBS);
         const repo = new PostgresObservationGenerationJobRepository(this.options.pool);
@@ -1765,45 +1793,51 @@ export class ServerV1PostgresRoutes implements RouteHandler {
         if (!teamId) return;
         if (!this.ensureProjectAllowed(req, res, body.projectId)) return;
         const platformSource = normalizePlatformSourceOrNull(body.platformSource);
+        // A prompt hook's query is the user's prompt. <private> sections are
+        // neither searched nor kept in the audit trail, and a query that was
+        // all private matches nothing (not the recency read an empty one means).
+        const query = body.query === undefined || !body.query.trim() ? null : stripMemoryTags(body.query);
         const limit = body.limit
           ?? (body.query ? SERVER_CONTEXT_QUERY_DEFAULT_LIMIT : SERVER_CONTEXT_RECENT_DEFAULT_LIMIT);
-        let results;
-        try {
-          const repo = new PostgresObservationRepository(this.options.pool);
-          // Both category reads use the same project/platform/folder/subagent
-          // scope as the ordinary mixed read, with filtering before LIMIT.
-          const searchInput = {
-            projectId: body.projectId,
-            teamId,
-            query: body.query ?? null,
-            limit,
-            platformSource,
-            folderProjects: body.folderProjects ?? null,
-            excludeSubagents: body.excludeSubagents === true,
-            excludeContentSessionId: body.excludeContentSessionId ?? null,
-            excludeContentSessionSince: body.excludeContentSessionSince ?? null,
-            excludeKinds: body.excludeKinds ?? null,
-          };
-          if (body.summaryLimit === undefined) {
-            results = await repo.search(searchInput);
-          } else {
-            const observationLimit = limit - body.summaryLimit;
-            const [observations, summaries] = await Promise.all([
-              observationLimit > 0
-                ? repo.search({ ...searchInput, limit: observationLimit, summary: false })
-                : Promise.resolve([]),
-              body.summaryLimit > 0
-                ? repo.search({ ...searchInput, limit: body.summaryLimit, summary: true })
-                : Promise.resolve([]),
-            ]);
-            results = [...observations, ...summaries].sort((a, b) =>
-              b.createdAtEpoch - a.createdAtEpoch || b.updatedAtEpoch - a.updatedAtEpoch);
+        let results: Awaited<ReturnType<PostgresObservationRepository['search']>> = [];
+        if (query !== '') {
+          try {
+            const repo = new PostgresObservationRepository(this.options.pool);
+            // Both category reads use the same project/platform/folder/subagent
+            // scope as the ordinary mixed read, with filtering before LIMIT.
+            const searchInput = {
+              projectId: body.projectId,
+              teamId,
+              query,
+              limit,
+              platformSource,
+              folderProjects: body.folderProjects ?? null,
+              excludeSubagents: body.excludeSubagents === true,
+              excludeContentSessionId: body.excludeContentSessionId ?? null,
+              excludeContentSessionSince: body.excludeContentSessionSince ?? null,
+              excludeKinds: body.excludeKinds ?? null,
+            };
+            if (body.summaryLimit === undefined) {
+              results = await repo.search(searchInput);
+            } else {
+              const observationLimit = limit - body.summaryLimit;
+              const [observations, summaries] = await Promise.all([
+                observationLimit > 0
+                  ? repo.search({ ...searchInput, limit: observationLimit, summary: false })
+                  : Promise.resolve([]),
+                body.summaryLimit > 0
+                  ? repo.search({ ...searchInput, limit: body.summaryLimit, summary: true })
+                  : Promise.resolve([]),
+              ]);
+              results = [...observations, ...summaries].sort((a, b) =>
+                b.createdAtEpoch - a.createdAtEpoch || b.updatedAtEpoch - a.updatedAtEpoch);
+            }
+          } catch (error) {
+            const err = error instanceof Error ? error : new Error(String(error));
+            logger.warn('SYSTEM', 'observation.context failed', { requestId: req.requestId ?? null }, err);
+            this.handleDbError(err, res, 'observation.context');
+            return;
           }
-        } catch (error) {
-          const err = error instanceof Error ? error : new Error(String(error));
-          logger.warn('SYSTEM', 'observation.context failed', { requestId: req.requestId ?? null }, err);
-          this.handleDbError(err, res, 'observation.context');
-          return;
         }
         const context = results
           .map(observation => observation.content)
@@ -1812,7 +1846,7 @@ export class ServerV1PostgresRoutes implements RouteHandler {
         await this.auditWrite(req, 'observation.read', null, body.projectId, {
           mode: 'context',
           ...(body.summaryLimit === undefined ? {} : { summaryLimit: body.summaryLimit }),
-          query: body.query ?? null,
+          query,
           limit,
           platformSource,
           folderProjects: body.folderProjects ?? null,

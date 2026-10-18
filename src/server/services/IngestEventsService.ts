@@ -51,17 +51,17 @@ function buildEventBullmqPayload(input: {
 // Tools whose output is navigation or bookkeeping. Their events are still
 // stored, but a paid generation call on one nearly always returns a memory
 // that only restates the call. CLAUDE_MEM_SERVER_GENERATION_SKIP_TOOLS
-// replaces this list (comma-separated; empty turns the filter off).
+// replaces this list (comma-separated; empty turns the filter off). Tools in
+// the client's CLAUDE_MEM_SKIP_TOOLS (TodoWrite, ListMcpResourcesTool, ...) are
+// already dropped by the hook in server runtime, so they are not repeated here.
 const DEFAULT_GENERATION_SKIP_TOOLS = [
   'ToolSearch',
   'Glob',
   'LS',
-  'TodoWrite',
   'TaskCreate',
   'TaskUpdate',
   'TaskList',
   'TaskGet',
-  'ListMcpResourcesTool',
   'ScheduleWakeup',
   'mcp__serena__get_symbols_overview',
   'mcp__serena__read_memory',

@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it } from 'bun:test';
 import {
+  recordSessionPrompt,
   sessionInitHandler,
   setSessionInitDependenciesForTesting,
 } from '../../../src/cli/handlers/session-init.js';
@@ -107,6 +108,29 @@ describe('sessionInitHandler prompt context in server runtime', () => {
     const empty = useServerRuntime({ semanticInject: true, rows: [] });
     expect((await submitPrompt()).hookSpecificOutput).toBeUndefined();
     expect(empty).toHaveLength(1);
+  });
+
+  it('never sends <private> sections, and skips a prompt that is all private', async () => {
+    const calls = useServerRuntime({ semanticInject: true, rows: [] });
+    await submitPrompt('why does the deploy fail <private>with password hunter2 in the env</private> on staging?');
+    expect(calls).toHaveLength(1);
+    expect(calls[0]!.request.query).not.toContain('hunter2');
+    expect(calls[0]!.request.query).toContain('why does the deploy fail');
+
+    const allPrivate = useServerRuntime({ semanticInject: true, rows: [] });
+    await submitPrompt('<private>an entirely private prompt that is long enough</private>');
+    expect(allPrivate).toHaveLength(0);
+  });
+
+  it('makes no prompt lookup for the transcript watcher, which discards the result', async () => {
+    const calls = useServerRuntime({ semanticInject: true, rows: [] });
+    await recordSessionPrompt({
+      sessionId: SESSION_ID,
+      cwd: '/tmp/session-init-server-prompt-context',
+      platform: 'claude-code',
+      prompt: 'why does the value tab report a net negative benefit?',
+    });
+    expect(calls).toHaveLength(0);
   });
 
   it('takes back this session\'s own memories from before its last compaction', async () => {

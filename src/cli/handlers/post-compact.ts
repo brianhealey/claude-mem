@@ -9,10 +9,17 @@
 import type { EventHandler, NormalizedHookInput, HookResult } from '../types.js';
 import { HOOK_EXIT_CODES } from '../../shared/hook-constants.js';
 import { markTimelinePending } from '../../shared/codex-compaction-gate.js';
+import { markCompacted } from '../../shared/session-compaction.js';
 
 export const postCompactHandler: EventHandler = {
   async execute(input: NormalizedHookInput): Promise<HookResult> {
     markTimelinePending(input.sessionId, input.agentId);
+    // The prompt hook's compaction time, in case SessionStart never reaches
+    // claude-mem. Root thread only: a subagent thread carries the root's
+    // session id, and its compaction leaves the root's context as it was.
+    if (input.sessionId && !input.agentId) {
+      markCompacted(input.sessionId);
+    }
     return { continue: true, suppressOutput: true, exitCode: HOOK_EXIT_CODES.SUCCESS };
   },
 };

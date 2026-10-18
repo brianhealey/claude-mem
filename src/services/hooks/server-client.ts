@@ -300,7 +300,8 @@ export class ServerClient {
     // /v1/search contract, where a query is genuinely required, and widening it
     // would let a search ship without one.
     const payload: Record<string, unknown> = { projectId: input.projectId };
-    if (input.query !== undefined) payload.query = input.query;
+    // A query can be the user's prompt; <private> sections stay on the machine.
+    if (input.query !== undefined) payload.query = stripMemoryTagsFromJsonStrings(input.query);
     if (input.limit !== undefined) payload.limit = input.limit;
     if (input.summaryLimit !== undefined) payload.summaryLimit = input.summaryLimit;
     if (input.platformSource !== undefined) {

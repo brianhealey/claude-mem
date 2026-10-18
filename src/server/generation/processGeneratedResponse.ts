@@ -350,16 +350,18 @@ async function persistGeneratedObservations(
     // context injection and search facet by folder without isolating memory.
     const sessionProject = await fetchSessionProject(client, fresh.serverSessionId, fresh.id);
 
-    // A batched job cancelled or otherwise moved on while the call ran keeps
-    // its own outcome.
+    // A batched job is completed here only while this attempt still owns its
+    // lock, like the carrying job above. One cancelled, reclaimed or claimed
+    // again by another worker while the call ran keeps its own outcome.
     const batchedJobs: PostgresObservationGenerationJob[] = [];
     for (const sibling of input.batchedJobs ?? []) {
       const current = await jobsRepo.getByIdForScope({
         id: sibling.id,
         projectId: fresh.projectId,
         teamId: fresh.teamId,
+        forUpdate: true,
       });
-      if (current?.status === 'processing' && current.agentEventId) {
+      if (current?.agentEventId && ownsProcessingAttempt(current, sibling)) {
         batchedJobs.push(current);
       }
     }

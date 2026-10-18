@@ -56,6 +56,8 @@ export class ActiveServerGenerationWorkerManager implements ServerGenerationWork
           pool: options.pool,
           provider: options.provider,
           workerId: this.workerId,
+          // A batched job released back to `queued` needs its own delivery.
+          resolveEventQueue: () => options.queueManager.getQueue('event'),
         });
   }
 

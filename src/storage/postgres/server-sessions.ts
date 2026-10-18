@@ -134,7 +134,8 @@ export class PostgresServerSessionsRepository {
         WHERE id = $1 AND project_id = $2 AND team_id = $3
         RETURNING *
       `,
-      [input.id, input.projectId, input.teamId, JSON.stringify(input.metadata)]
+      // Stripped like create(): the metadata can carry the opening prompt.
+      [input.id, input.projectId, input.teamId, JSON.stringify(stripMemoryTagsFromJsonStrings(input.metadata))]
     );
     if (!row) return null;
     const session = mapServerSessionRow(row);

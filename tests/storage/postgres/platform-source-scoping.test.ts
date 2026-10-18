@@ -263,6 +263,59 @@ describe('server-beta Postgres platform source scoping', () => {
     ]);
   });
 
+  it('ranks whole-query matches first in the widened search and bounds the substring match', async () => {
+    const client = new CapturingClient();
+    const repo = new PostgresObservationRepository(client);
+
+    await repo.search({ projectId: 'project-1', teamId: 'team-1', query: 'auth bug', limit: 7 });
+
+    const widened = client.calls[1]!.text;
+    expect(widened).toContain('length($3) <= 128 AND position(lower($3) in lower(observations.content)) > 0');
+    const order = widened.slice(widened.indexOf('ORDER BY'));
+    expect(order.indexOf('CASE WHEN $8::boolean THEN (')).toBeGreaterThan(-1);
+    expect(order.indexOf('CASE WHEN $8::boolean THEN (')).toBeLessThan(order.indexOf('ts_rank('));
+  });
+
+  it('runs a query of many terms (a prompt) as one widened search', async () => {
+    const client = new CapturingClient();
+    const repo = new PostgresObservationRepository(client);
+
+    await repo.search({
+      projectId: 'project-1',
+      teamId: 'team-1',
+      query: 'why does the value tab report a net negative benefit for this project',
+    });
+
+    expect(client.calls).toHaveLength(1);
+    expect(client.calls[0]!.values?.[7]).toBe(true);
+  });
+
+  it('runs a single-term query once, without widening', async () => {
+    const client = new CapturingClient();
+    const repo = new PostgresObservationRepository(client);
+
+    await repo.search({ projectId: 'project-1', teamId: 'team-1', query: 'registries' });
+
+    expect(client.calls).toHaveLength(1);
+    expect(client.calls[0]!.values?.[7]).toBe(false);
+  });
+
+  it('strips <private> sections from metadata filled into an existing session', async () => {
+    const client = new CapturingClient();
+    const repo = new PostgresServerSessionsRepository(client);
+
+    await repo.fillMissingMetadata({
+      id: 'session-1',
+      projectId: 'project-1',
+      teamId: 'team-1',
+      metadata: { project: 'alpha', prompt: 'ship it <private>secret-token-xyz</private>' },
+    });
+
+    const stored = String(client.calls[0]!.values?.[3]);
+    expect(stored).not.toContain('secret-token-xyz');
+    expect(stored).toContain('alpha');
+  });
+
   it('passes the main-agent-only flag that leaves subagent rows out', async () => {
     const client = new CapturingClient();
     const repo = new PostgresObservationRepository(client);

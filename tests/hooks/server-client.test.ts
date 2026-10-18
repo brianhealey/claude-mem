@@ -278,6 +278,15 @@ describe('ServerClient', () => {
     expect(result.observations).toHaveLength(2);
   });
 
+  it('contextObservations leaves <private> sections out of the query', async () => {
+    installFetch(async () => new Response(JSON.stringify({ observations: [], context: '' }), { status: 200 }));
+    const client = new ServerClient({ serverBaseUrl: 'http://localhost:9999', apiKey: 'cmem_test' });
+    await client.contextObservations({ projectId: 'p1', query: 'deploy the api <private>token abc123</private> today' });
+    const query = (captured[0]?.body as Record<string, unknown>).query as string;
+    expect(query).not.toContain('abc123');
+    expect(query).toContain('deploy the api');
+  });
+
   it('getJobStatus sends GET /v1/jobs/:id', async () => {
     installFetch(async () => new Response(
       JSON.stringify({ generationJob: { id: 'j1', status: 'queued' } }),

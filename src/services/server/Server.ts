@@ -156,6 +156,13 @@ export interface ServerOptions {
    * unset: it authenticates with API keys and serves public DNS names.
    */
   originPolicy?: WorkerOriginPolicy;
+  /**
+   * Server runtime: the same origin list, applied to CORS only. No Host check
+   * or delete guard is mounted, so hooks and proxies reaching the server by an
+   * internal name keep working; API keys are what authenticate a request.
+   * Ignored when originPolicy is set.
+   */
+  corsPolicy?: WorkerOriginPolicy;
 }
 
 // #2572 — hand-rolled security headers.
@@ -365,7 +372,7 @@ export class Server {
       // not a list of the ones someone remembered.
       this.app.use(createForeignPageDeleteGuard(this.options.originPolicy));
     }
-    this.app.use(createCorsMiddleware(this.options.originPolicy));
+    this.app.use(createCorsMiddleware(this.options.originPolicy ?? this.options.corsPolicy));
   }
 
   private setupPreBodyParserRoutes(): void {

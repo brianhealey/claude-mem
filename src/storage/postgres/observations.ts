@@ -73,6 +73,15 @@ interface ObservationSourceRow {
 const RELAXED_SEARCH_BELOW_RESULTS = 3;
 // Sharing this many distinct terms is enough however long the query is.
 const RELAXED_SEARCH_ENOUGH_TERMS = 4;
+// A query with more terms than this (a prompt, say) all but never matches
+// whole, so it goes straight to the widened search.
+const RELAXED_SEARCH_DIRECT_ABOVE_TERMS = 8;
+// The substring match is for a file name or a short phrase. Unindexed, it
+// scans every row, and a longer query would not be a substring of anything.
+const SUBSTRING_SEARCH_MAX_CHARS = 128;
+// Whole-query substring match, bounded to short queries.
+const SUBSTRING_MATCH_SQL =
+  `(length($3) <= ${SUBSTRING_SEARCH_MAX_CHARS} AND position(lower($3) in lower(observations.content)) > 0)`;
 
 export interface ObservationSearchInput {
   projectId: string;
@@ -235,15 +244,21 @@ export class PostgresObservationRepository {
   // agentId and an agentType (src/shared/subagent-predicate.ts). An agent id
   // alone is main-agent work (transcript-watch seats), and rows with no event
   // source (summaries, direct memories) always stay.
-  // A query is first matched whole: every term, or the text as a substring.
-  // A natural-language question rarely survives that, so when it finds next to
-  // nothing the search is run again accepting rows that hold at least half of
-  // the query's terms (or RELAXED_SEARCH_ENOUGH_TERMS of them, for a query as
-  // long as a prompt), ranked after the whole matches.
+  // A query is first matched whole: every term, or (when short) the text as a
+  // substring. A natural-language question rarely survives that, so when it
+  // finds next to nothing the search is run again accepting rows that hold at
+  // least half of the query's terms (or RELAXED_SEARCH_ENOUGH_TERMS of them,
+  // for a query as long as a prompt), ranked after the whole matches. A query
+  // of more than RELAXED_SEARCH_DIRECT_ABOVE_TERMS terms runs only the widened
+  // search, which still ranks any whole match first.
   async search(input: ObservationSearchInput): Promise<PostgresObservation[]> {
-    const strict = await this.runSearch(input, false);
     const query = input.query?.trim() ?? '';
-    if (strict.length >= RELAXED_SEARCH_BELOW_RESULTS || !/\s/.test(query)) {
+    const terms = query ? query.split(/\s+/).length : 0;
+    if (terms > RELAXED_SEARCH_DIRECT_ABOVE_TERMS) {
+      return this.runSearch(input, true);
+    }
+    const strict = await this.runSearch(input, false);
+    if (strict.length >= RELAXED_SEARCH_BELOW_RESULTS || terms < 2) {
       return strict;
     }
     return this.runSearch(input, true);
@@ -273,7 +288,7 @@ export class PostgresObservationRepository {
             -- The english parser keeps registries.yaml or src/a/b.ts as one
             -- file token, so a search for "registries" misses it. A plain
             -- substring match catches those; such rows rank after FTS hits.
-            OR position(lower($3) in lower(observations.content)) > 0
+            OR ${SUBSTRING_MATCH_SQL}
             OR (
               $8::boolean
               AND observations.content_search @@ replace(plainto_tsquery('english', $3)::text, ' & ', ' | ')::tsquery
@@ -349,6 +364,12 @@ export class PostgresObservationRepository {
           )
         ORDER BY
           CASE WHEN $3::text IS NULL THEN observations.created_at END DESC,
+          -- In the widened search, whole-query matches come before rows that
+          -- only share enough terms.
+          CASE WHEN $8::boolean THEN (
+            observations.content_search @@ websearch_to_tsquery('english', $3)
+            OR ${SUBSTRING_MATCH_SQL}
+          ) END DESC NULLS LAST,
           ts_rank(observations.content_search, websearch_to_tsquery('english', $3)) DESC,
           CASE WHEN $8::boolean THEN ts_rank(
             observations.content_search,

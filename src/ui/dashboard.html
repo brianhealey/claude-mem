@@ -360,7 +360,7 @@
     </section>
 
     <section id="tab-keys" hidden>
-      <p id="keys-readonly" class="banner" hidden>This key is read-only. Managing keys needs a key with write access.</p>
+      <p id="keys-readonly" class="banner" hidden>Managing keys needs an admin key, created on the server with <code>server api-key create --admin</code>.</p>
       <div id="keys-body">
         <div id="minted" class="minted" hidden></div>
         <form id="mint-form" class="toolbar">
@@ -381,7 +381,7 @@
       </div>
     </section>
     <section id="tab-audit" hidden>
-      <p id="audit-readonly" class="banner" hidden>This key is read-only. The audit trail needs a key with write access.</p>
+      <p id="audit-readonly" class="banner" hidden>The audit trail needs an admin key, created on the server with <code>server api-key create --admin</code>.</p>
       <div id="audit-body">
         <div class="toolbar">
           <select id="audit-action" aria-label="Action">
@@ -420,6 +420,8 @@
     apiKey: null,
     who: null,
     canWrite: false,
+    canManageKeys: false,
+    failedCount: 0,
     projectId: null,
     tab: 'memories',
     offset: 0,
@@ -549,7 +551,7 @@
     localStorage.removeItem(STORAGE_KEY);
     clearInterval(state.pipelineTimer);
     clearInterval(state.memoriesTimer);
-    Object.assign(state, { apiKey: null, who: null, canWrite: false, projectId: null });
+    Object.assign(state, { apiKey: null, who: null, canWrite: false, canManageKeys: false, projectId: null });
     $('app').hidden = true;
     $('signin').hidden = false;
     $('signin-error').textContent = message || '';
@@ -568,8 +570,11 @@
     }
     (remember ? localStorage : sessionStorage).setItem(STORAGE_KEY, apiKey);
     state.who = who;
-    state.canWrite = who.scopes.includes('memories:write');
-    $('access').textContent = state.canWrite ? 'read + write' : 'read-only';
+    const holds = scope => who.scopes.includes(scope) || who.scopes.includes('*');
+    state.canWrite = holds('memories:write');
+    // Keys and the audit trail need keys:manage, which hook keys never carry.
+    state.canManageKeys = holds('keys:manage');
+    $('access').textContent = state.canManageKeys ? 'admin' : state.canWrite ? 'read + write' : 'read-only';
     $('signin').hidden = true;
     $('app').hidden = false;
     await loadProjects();
@@ -1133,6 +1138,7 @@
       }
 
       const failedCount = summary.counts.failed;
+      state.failedCount = failedCount;
       $('failed-status').textContent = failedCount === 0 ? 'No failed jobs.' : `${failedCount} failed, grouped by reason.`;
       $('retry-all').hidden = !(state.canWrite && failedCount > 0);
       const reasonTable = clear($('failed-reasons'));
@@ -1390,22 +1396,36 @@
       button.disabled = false;
     }
   }
+  // Every failed job is a provider call once requeued, so this takes the same
+  // two-step confirm as a delete, naming how many jobs it covers.
+  let retryAllArmed = false;
+  let retryAllTimer = null;
   $('retry-all').addEventListener('click', async () => {
-    await retryFailed($('retry-all'), null);
-    $('retry-all').textContent = 'Retry all failed';
+    const button = $('retry-all');
+    if (!retryAllArmed) {
+      retryAllArmed = true;
+      button.textContent = `Confirm: requeue ${state.failedCount} failed job${state.failedCount === 1 ? '' : 's'}`;
+      retryAllTimer = setTimeout(() => { retryAllArmed = false; button.textContent = 'Retry all failed'; }, 4000);
+      return;
+    }
+    clearTimeout(retryAllTimer);
+    retryAllArmed = false;
+    await retryFailed(button, null);
+    button.textContent = 'Retry all failed';
   });
 
   // ---- Keys ----
   async function loadKeys() {
-    $('keys-readonly').hidden = state.canWrite;
-    $('keys-body').hidden = !state.canWrite;
-    if (!state.canWrite) return;
+    $('keys-readonly').hidden = state.canManageKeys;
+    $('keys-body').hidden = !state.canManageKeys;
+    if (!state.canManageKeys) return;
     try {
       const { keys } = await api('GET', '/v1/keys');
       const table = clear($('keys'));
       table.append(headerRow('Key', 'Access', 'Status', 'Last used', 'Created', 'Expires', ''));
       for (const key of keys) {
-        const access = key.scopes.includes('memories:write') ? 'read + write'
+        const access = key.scopes.includes('keys:manage') ? 'admin'
+          : key.scopes.includes('memories:write') ? 'read + write'
           : key.scopes.length === 1 && key.scopes[0] === 'memories:read' ? 'read-only'
           : key.scopes.join(', ') || '—';
         const statusClass = key.status === 'active' ? 'ok' : key.status === 'expired' ? 'warn' : 'bad';
@@ -1449,9 +1469,9 @@
   }
 
   async function reloadAudit() {
-    $('audit-readonly').hidden = state.canWrite;
-    $('audit-body').hidden = !state.canWrite;
-    if (!state.canWrite) return;
+    $('audit-readonly').hidden = state.canManageKeys;
+    $('audit-body').hidden = !state.canManageKeys;
+    if (!state.canManageKeys) return;
     state.auditOffset = 0;
     clear($('audit')).append(headerRow('When', 'Action', 'Key', 'What'));
     await loadAudit();

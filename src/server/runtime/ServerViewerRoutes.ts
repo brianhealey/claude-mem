@@ -91,7 +91,8 @@ export class ServerViewerRoutes implements RouteHandler {
         return;
       }
       res.setHeader('Content-Type', 'text/html; charset=utf-8');
-      // The page holds an API key in memory; keep it out of shared caches.
+      // The page handles a pasted API key (sessionStorage, or localStorage when
+      // "remember" is ticked); keep it out of shared caches.
       res.setHeader('Cache-Control', 'no-store');
       res.send(dashboardHtmlBytes);
     });

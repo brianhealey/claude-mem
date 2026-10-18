@@ -3,6 +3,7 @@ import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'fs';
 import { join } from 'path';
 import { tmpdir } from 'os';
 import { markCompacted, readCompactedAt } from '../../src/shared/session-compaction.js';
+import { postCompactHandler } from '../../src/cli/handlers/post-compact.js';
 
 describe('session-compaction', () => {
   let dataDir: string;
@@ -40,5 +41,13 @@ describe('session-compaction', () => {
     mkdirSync(dir, { recursive: true });
     writeFileSync(join(dir, 'session-garbled'), 'not a date');
     expect(readCompactedAt('session-garbled')).toBeNull();
+  });
+
+  it('is recorded by a Codex PostCompact on the root thread, not on a subagent thread', async () => {
+    await postCompactHandler.execute({ sessionId: 'codex-subagent-root', agentId: 'agent-1', platform: 'codex', cwd: dataDir });
+    expect(readCompactedAt('codex-subagent-root')).toBeNull();
+
+    await postCompactHandler.execute({ sessionId: 'codex-root', platform: 'codex', cwd: dataDir });
+    expect(readCompactedAt('codex-root')).not.toBeNull();
   });
 });

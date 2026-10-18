@@ -121,6 +121,11 @@ interface VerifiedPostgresApiKey {
   scopes: string[];
 }
 
+const LAST_USED_WRITE_INTERVAL_MS = 60_000;
+// One entry per key that has authenticated in this process: bounded by the
+// number of keys, which is small.
+const lastUsedWrittenAt = new Map<string, number>();
+
 export async function verifyPostgresApiKey(
   pool: PostgresPool,
   rawKey: string,
@@ -160,12 +165,17 @@ export async function verifyPostgresApiKey(
     return null;
   }
   // Best effort and at most one write a minute per key, so a busy key does not
-  // turn every authenticated read into a row update.
-  void pool.query(
-    `UPDATE api_keys SET last_used_at = now()
-      WHERE id = $1 AND (last_used_at IS NULL OR last_used_at < now() - interval '1 minute')`,
-    [row.id],
-  ).catch(() => {});
+  // turn every authenticated read into a row update. The in-process stamp
+  // skips the round trip; the WHERE clause covers other server processes.
+  const now = Date.now();
+  if (now - (lastUsedWrittenAt.get(row.id) ?? 0) >= LAST_USED_WRITE_INTERVAL_MS) {
+    lastUsedWrittenAt.set(row.id, now);
+    void pool.query(
+      `UPDATE api_keys SET last_used_at = now()
+        WHERE id = $1 AND (last_used_at IS NULL OR last_used_at < now() - interval '1 minute')`,
+      [row.id],
+    ).catch(() => {});
+  }
   return {
     apiKeyId: row.id,
     teamId: row.team_id,

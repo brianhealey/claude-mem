@@ -346,6 +346,8 @@ export class PostgresObservationGenerationJobRepository {
             AND status = 'queued'
             AND id <> $4
             AND attempts < max_attempts
+            -- A job waiting out a retry backoff is not taken early.
+            AND (next_attempt_at IS NULL OR next_attempt_at <= now())
             AND (payload->>'api_key_id') IS NOT DISTINCT FROM $5::text
           ORDER BY created_at ASC
           LIMIT $7

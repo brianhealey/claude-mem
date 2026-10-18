@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 //
-// Key issuance + connect onboarding: POST /v1/keys mints a read-only key for the
-// team and GET /v1/connect returns the paste-ready MCP command. Postgres-gated.
+// Key issuance + connect onboarding: POST /v1/keys (keys:manage) mints a
+// read-only key for the team and GET /v1/connect returns the paste-ready MCP
+// command. Postgres-gated.
 //
 // The important assertion: a key minted via POST /v1/keys actually authenticates
 // against the API (it lands in the same postgres api_keys store readAuth checks).
@@ -36,6 +37,7 @@ describe('POST /v1/keys + GET /v1/connect', () => {
   let storage: PostgresStorageRepositories;
   let server: Server;
   let port: number;
+  let adminKey: string;
   let writeKey: string;
   let readKey: string;
   let spies: ReturnType<typeof spyOn>[] = [];
@@ -53,6 +55,8 @@ describe('POST /v1/keys + GET /v1/connect', () => {
     const team = await storage.teams.create({ name: 'team' });
     const project = await storage.projects.create({ teamId: team.id, name: 'p' });
 
+    const a = newApiKey(); adminKey = a.raw;
+    await storage.auth.createApiKey({ keyHash: a.hash, teamId: team.id, projectId: project.id, actorId: 't', scopes: ['memories:read', 'memories:write', 'keys:manage'] });
     const w = newApiKey(); writeKey = w.raw;
     await storage.auth.createApiKey({ keyHash: w.hash, teamId: team.id, projectId: project.id, actorId: 't', scopes: ['memories:read', 'memories:write'] });
     const r = newApiKey(); readKey = r.raw;
@@ -91,7 +95,7 @@ describe('POST /v1/keys + GET /v1/connect', () => {
   it('mints a read-only key whose connect command targets /v1/mcp', async () => {
     const r = await fetch(url('/v1/keys'), {
       method: 'POST',
-      headers: { Authorization: `Bearer ${writeKey}`, 'Content-Type': 'application/json' },
+      headers: { Authorization: `Bearer ${adminKey}`, 'Content-Type': 'application/json' },
       body: JSON.stringify({ expiresInDays: 30 }),
     });
     expect(r.status).toBe(201);
@@ -105,17 +109,19 @@ describe('POST /v1/keys + GET /v1/connect', () => {
 
   it('the minted key actually authenticates against the API', async () => {
     const minted = await (await fetch(url('/v1/keys'), {
-      method: 'POST', headers: { Authorization: `Bearer ${writeKey}`, 'Content-Type': 'application/json' }, body: '{}',
+      method: 'POST', headers: { Authorization: `Bearer ${adminKey}`, 'Content-Type': 'application/json' }, body: '{}',
     })).json() as { apiKey: string };
     const usage = await fetch(url('/v1/usage'), { headers: { Authorization: `Bearer ${minted.apiKey}` } });
     expect(usage.status).toBe(200);
   });
 
-  it('a read-only key cannot mint keys (write scope required)', async () => {
-    const r = await fetch(url('/v1/keys'), {
-      method: 'POST', headers: { Authorization: `Bearer ${readKey}`, 'Content-Type': 'application/json' }, body: '{}',
-    });
-    expect([401, 403]).toContain(r.status);
+  it('neither a read-only key nor a write key without keys:manage can mint keys', async () => {
+    for (const key of [readKey, writeKey]) {
+      const r = await fetch(url('/v1/keys'), {
+        method: 'POST', headers: { Authorization: `Bearer ${key}`, 'Content-Type': 'application/json' }, body: '{}',
+      });
+      expect([401, 403]).toContain(r.status);
+    }
   });
 
   it('GET /v1/connect returns the command with a placeholder key', async () => {

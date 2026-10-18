@@ -88,6 +88,15 @@ export interface ProviderObservationGeneratorOptions {
   // Most events one call may cover. Defaults to
   // CLAUDE_MEM_SERVER_GENERATION_BATCH_MAX_EVENTS; 1 turns batching off.
   batchMaxEvents?: number;
+  // The event lane, used to republish a batched job released back to
+  // `queued` (see settleBatch). Without it such a job stays queued with no
+  // BullMQ delivery, so the worker manager always passes one.
+  resolveEventQueue?: () => BatchRequeueQueue | null;
+}
+
+export interface BatchRequeueQueue {
+  add(jobId: string, payload: never, options?: { delay?: number }): Promise<unknown>;
+  remove(jobId: string): Promise<unknown>;
 }
 
 // #4100: nothing bounded the provider call, so one hung request held the
@@ -397,8 +406,8 @@ export class ProviderObservationGenerator {
   // After the call, every batched job must leave `processing`. A persisted
   // batch already completed them, which makes this a no-op. Otherwise each
   // follows the same never-pay-twice rule as the job that carried it. A
-  // requeued one has no BullMQ delivery of its own left; the carrying job's
-  // retry, or the session's next event job, takes it again.
+  // requeued one has no BullMQ delivery of its own left (lockOutbox skipped it
+  // while it was batched), so it is republished.
   private async settleBatch(batched: PostgresObservationGenerationJob[], error: unknown): Promise<void> {
     if (batched.length === 0) return;
     const terminal = error instanceof ServerGenerationTerminalOutcomeError ? error : null;
@@ -420,6 +429,7 @@ export class ProviderObservationGenerator {
           retryable,
           ...(this.options.workerId !== undefined ? { workerId: this.options.workerId } : {}),
         });
+        await this.republishRequeued(sibling);
       } catch (settleError) {
         logger.warn('SYSTEM', '[generation] could not settle a batched job', {
           jobId: sibling.id,
@@ -427,6 +437,52 @@ export class ProviderObservationGenerator {
         });
       }
     }
+  }
+
+  // Puts a sibling that markGenerationFailed left `queued` back on BullMQ, the
+  // way the stale-lock sweep republishes, after its retry backoff. When that
+  // is impossible the row moves to `failed`, which the operator retry route
+  // accepts, instead of sitting in `queued` with nothing to deliver it.
+  private async republishRequeued(sibling: PostgresObservationGenerationJob): Promise<void> {
+    const resolveQueue = this.options.resolveEventQueue;
+    if (!resolveQueue) return;
+    const repo = new PostgresObservationGenerationJobRepository(this.options.pool);
+    const current = await repo.getByIdForScope({
+      id: sibling.id,
+      projectId: sibling.projectId,
+      teamId: sibling.teamId,
+    });
+    // Completed, failed, or already claimed again: nothing to deliver.
+    if (current?.status !== 'queued' || current.attempts !== sibling.attempts) return;
+
+    const queue = resolveQueue();
+    let failure: string | null = null;
+    if (!queue || !current.bullmqJobId) {
+      failure = !queue ? 'no queue for lane' : 'job has no bullmq_job_id';
+    } else {
+      try {
+        // The finished BullMQ entry still holds this jobId; adding over it
+        // would be a no-op.
+        try { await queue.remove(current.bullmqJobId); } catch { /* already gone */ }
+        const delay = Math.max(0, (current.nextAttemptAtEpoch ?? 0) - Date.now());
+        await queue.add(current.bullmqJobId, current.payload as never, delay > 0 ? { delay } : undefined);
+      } catch (error) {
+        failure = error instanceof Error ? error.message : String(error);
+      }
+    }
+    if (failure === null) return;
+
+    logger.warn('SYSTEM', '[generation] could not republish a released batched job; marking it failed', {
+      jobId: current.id,
+      error: failure,
+    });
+    await repo.transitionStatus({
+      id: current.id,
+      projectId: current.projectId,
+      teamId: current.teamId,
+      status: 'failed',
+      lastError: { reason: 'batch_requeue_unpublished', error: failure },
+    });
   }
 
   private async loadBatchedEvents(

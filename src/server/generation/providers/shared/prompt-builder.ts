@@ -139,7 +139,7 @@ export function buildServerGenerationPrompt(
     ...(recordedTitles.length > 0
       ? [
         '  <already_recorded>',
-        ...recordedTitles.map(title => `    <title>${escapeXml(title)}</title>`),
+        ...recordedTitles.map(title => `    <title>${escapeXmlText(title)}</title>`),
         '  </already_recorded>',
       ]
       : []),

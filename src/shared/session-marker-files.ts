@@ -4,7 +4,7 @@
 //
 // Fail-open throughout: a filesystem error must never break a hook. Errors are
 // logged and reported as "no marker"; each gate documents what that means for it.
-import { existsSync, mkdirSync, rmSync, unlinkSync, writeFileSync } from 'fs';
+import { existsSync, mkdirSync, readFileSync, rmSync, unlinkSync, writeFileSync } from 'fs';
 import { createHash } from 'crypto';
 import { dirname, join } from 'path';
 import { resolveDataDir } from './paths.js';
@@ -15,7 +15,10 @@ const SAFE_MARKER_KEY = /^[A-Za-z0-9_-]{1,128}$/;
 export interface SessionMarkerFiles {
   /** True when the key's marker exists. */
   has(key: string): boolean;
-  mark(key: string): void;
+  /** Writes the marker, holding `at` (now by default) as an ISO time. */
+  mark(key: string, at?: Date): void;
+  /** The marker's trimmed contents, or null when there is none. */
+  read(key: string): string | null;
   clear(key: string): void;
   /**
    * Removes the key's marker and reports whether this call removed it. When
@@ -50,13 +53,24 @@ export function sessionMarkerFiles(directoryName: string, logLabel: string): Ses
       }
     },
 
-    mark(key) {
+    mark(key, at = new Date()) {
       try {
         const marker = markerPath(key);
         mkdirSync(dirname(marker), { recursive: true });
-        writeFileSync(marker, new Date().toISOString());
+        writeFileSync(marker, at.toISOString());
       } catch (error) {
         warnFailedOpen('mark', error);
+      }
+    },
+
+    read(key) {
+      try {
+        return readFileSync(markerPath(key), 'utf8').trim();
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== 'ENOENT') {
+          warnFailedOpen('read', error);
+        }
+        return null;
       }
     },
 

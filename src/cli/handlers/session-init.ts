@@ -18,7 +18,7 @@ import { shouldTrackProject as defaultShouldTrackProject } from '../../shared/sh
 import { loadFromFileOnce as defaultLoadFromFileOnce } from '../../shared/hook-settings.js';
 import { normalizePlatformSource } from '../../shared/platform-source.js';
 import { workStatePlatform } from '../../shared/work-state-telemetry.js';
-import { isCodexInternalPrompt, isInternalProtocolPayload } from '../../utils/tag-stripping.js';
+import { isCodexInternalPrompt, isInternalProtocolPayload, stripMemoryTags } from '../../utils/tag-stripping.js';
 import {
   resolveRuntimeContext as defaultResolveRuntimeContext,
   logServerFallback as defaultLogServerFallback,
@@ -236,7 +236,17 @@ const sessionInit = {
             Math.floor(sessionInitTimeoutMs / SESSION_INIT_SERVER_TIMEOUT_DIVISOR),
           ),
         );
-        if (semanticInject && prompt.length >= 20 && prompt !== '[media prompt]') {
+        // The transcript watcher throws the result away, so a lookup for it
+        // would only be recorded as memory injected with a prompt.
+        if (!requireRecordedPrompt && semanticInject && prompt.length >= 20 && prompt !== '[media prompt]') {
+          // CLAUDE_MEM_SEMANTIC_INJECT_FORMAT=index is not honoured here: it
+          // points the model at get_observations, which reads the worker and
+          // cannot resolve server memory ids.
+          if (String(settings.CLAUDE_MEM_SEMANTIC_INJECT_FORMAT).toLowerCase() === 'index') {
+            logger.debug('HOOK', 'session-init: CLAUDE_MEM_SEMANTIC_INJECT_FORMAT=index is ignored in server runtime', {
+              contentSessionId: sessionId,
+            });
+          }
           const remainingMs = remainingSessionInitTimeoutMs(sessionInitStartedAt, sessionInitTimeoutMs);
           const additionalContext = remainingMs < SESSION_INIT_MIN_REMAINING_TIMEOUT_MS
             ? ''
@@ -418,6 +428,7 @@ async function startServerSession(
 // A prompt is searched by its opening: the store matches on shared terms, and
 // the first few sentences say what the prompt is about.
 const SERVER_PROMPT_QUERY_MAX_CHARS = 600;
+const SERVER_PROMPT_QUERY_MIN_CHARS = 20;
 const SERVER_PROMPT_MEMORY_MAX_CHARS = 700;
 
 /**
@@ -439,12 +450,16 @@ async function fetchServerPromptContext(
     timeoutMs: number;
   },
 ): Promise<string> {
+  // <private> sections never leave the machine, the same as on the worker
+  // path; a prompt that is all private gets no lookup.
+  const query = stripMemoryTags(request.prompt).trim().slice(0, SERVER_PROMPT_QUERY_MAX_CHARS);
+  if (query.length < SERVER_PROMPT_QUERY_MIN_CHARS) return '';
   const compactedAt = readCompactedAt(request.sessionId);
   let rows: Awaited<ReturnType<ServerRuntimeContext['client']['contextObservations']>>['observations'];
   try {
     const result = await runtime.client.contextObservations({
       projectId: runtime.projectId,
-      query: request.prompt.slice(0, SERVER_PROMPT_QUERY_MAX_CHARS),
+      query,
       limit: request.limit,
       // Excluded by the server, so the read it records is what gets injected.
       excludeContentSessionId: request.sessionId,

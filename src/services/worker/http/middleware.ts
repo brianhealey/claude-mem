@@ -258,7 +258,7 @@ export function createCorsMiddleware(policy?: WorkerOriginPolicy): RequestHandle
     }
     if (req.method === 'OPTIONS') {
       res.setHeader('Access-Control-Allow-Methods', 'GET,HEAD,POST,PUT,PATCH,DELETE');
-      res.setHeader('Access-Control-Allow-Headers', 'Content-Type,Authorization,X-Requested-With');
+      res.setHeader('Access-Control-Allow-Headers', 'Content-Type,Authorization,X-Requested-With,X-Claude-Mem-Client');
       res.status(204).end();
       return;
     }
